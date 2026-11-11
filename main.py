@@ -27,9 +27,14 @@ STATE = {
     "logs": [],
     "stats": {"success": 0, "fail": 0, "codes": 0},
     "latest_code": None,
+    "tg_user": None,
+    # Quản lý trạng thái OTP Telegram realtime
+    "auth_step": "IDLE", # IDLE, WAIT_PHONE, WAIT_CODE, WAIT_PASSWORD, SUCCESS
+    "auth_prompt": "",
 }
 LOG_Q = queue.Queue()
 PROCESSED_MSG_IDS = set()
+AUTH_INPUT_QUEUE = queue.Queue()
 
 def log(msg, level="info"):
     e = {"t": time.strftime("%H:%M:%S"), "msg": msg, "lvl": level}
@@ -43,6 +48,7 @@ class Account:
     def __init__(self, un, pw, nick):
         self.un, self.pw, self.nick = un, pw, nick
         self.jwt, self.jwt_exp = None, 0
+        self.balance = 0
         self.used = set()
         self.lock = threading.Lock()
 
@@ -70,6 +76,23 @@ class Account:
     def valid(self):
         return self.jwt and time.time() < self.jwt_exp - 60
 
+    def fetch_balance(self):
+        """Lấy số dư thực tế từ API LC79"""
+        if not self.valid() and not self.login():
+            return
+        try:
+            r = requests.get(
+                "https://gameapi.tele68.com/v1/user/profile?cp=R&cl=R&pf=web&at=",
+                headers=self.hdr(self.jwt),
+                timeout=(3, 10))
+            if r.status_code == 200:
+                d = r.json()
+                # Tùy cấu trúc trả về của api profile
+                bal = d.get("balance") or d.get("money") or (d.get("data") or {}).get("balance") or 0
+                self.balance = float(bal)
+        except Exception as e:
+            log(f"[{self.nick}] Không lấy được số dư: {e}", "warn")
+
     def login(self):
         try:
             r = requests.get(
@@ -86,10 +109,13 @@ class Account:
                 headers=self.hdr(),
                 json={"nickName": self.nick, "accessToken": at},
                 timeout=(5, 20))
-            tok = r2.json().get("token")
+            res_data = r2.json()
+            tok = res_data.get("token")
             if tok:
                 self.jwt = tok
                 self.jwt_exp = self.parse_exp(tok)
+                # Lấy số dư ngay sau khi login thành công
+                self.fetch_balance()
                 return True
             return False
         except Exception as e:
@@ -133,6 +159,8 @@ class Account:
                 else:
                     log(f"[{self.nick}] ✅ SUCCESS — {code}", "ok")
                 STATE["stats"]["success"] += 1
+                # Cập nhật lại số dư sau khi redeem thành công
+                self.fetch_balance()
             elif r.status_code == 400:
                 log(f"[{self.nick}] ❌ 400 {d.get('message','')} — {code}", "err")
                 STATE["stats"]["fail"] += 1
@@ -159,12 +187,14 @@ def bot_start(cfg):
         return False, f"Config lỗi: {e}"
 
     BOT["accounts"] = accs
-    STATE["accounts"] = [{"un": a.un, "nick": a.nick, "ok": False} for a in accs]
+    STATE["accounts"] = [{"un": a.un, "nick": a.nick, "ok": False, "balance": 0} for a in accs]
     STATE["chat_id"] = None
     STATE["group_joined"] = False
     STATE["stats"] = {"success": 0, "fail": 0, "codes": 0}
     STATE["latest_code"] = None
+    STATE["tg_user"] = None
     STATE["running"] = True
+    STATE["auth_step"] = "IDLE"
     PROCESSED_MSG_IDS.clear()
 
     def runner():
@@ -180,6 +210,37 @@ async def _bot_main(cfg, accs, api_id):
     from telethon import TelegramClient, events, utils
     from telethon.tl.functions.channels import JoinChannelRequest
 
+    # Custom input callback để bắt yêu cầu SĐT/OTP gửi thẳng ra Web UI thay vì terminal
+    async def interactive_phone():
+        STATE["auth_step"] = "WAIT_PHONE"
+        STATE["auth_prompt"] = "Vui lòng nhập số điện thoại Telegram (ví dụ: +84912345678):"
+        log("📱 Yêu cầu nhập Số điện thoại Telegram trên giao diện Web...", "warn")
+        while True:
+            val = await asyncio.get_event_loop().run_in_executor(None, AUTH_INPUT_QUEUE.get)
+            if val:
+                STATE["auth_step"] = "IDLE"
+                return val
+
+    async def interactive_code():
+        STATE["auth_step"] = "WAIT_CODE"
+        STATE["auth_prompt"] = "Vui lòng nhập mã OTP Telegram nhận được:"
+        log("🔑 Yêu cầu nhập Mã OTP Telegram trên giao diện Web...", "warn")
+        while True:
+            val = await asyncio.get_event_loop().run_in_executor(None, AUTH_INPUT_QUEUE.get)
+            if val:
+                STATE["auth_step"] = "IDLE"
+                return val
+
+    async def interactive_password():
+        STATE["auth_step"] = "WAIT_PASSWORD"
+        STATE["auth_prompt"] = "Vui lòng nhập mật khẩu Mật khẩu 2 lớp (Cloud Password):"
+        log("🔒 Yêu cầu nhập Mật khẩu 2 lớp (2FA) Telegram trên giao diện Web...", "warn")
+        while True:
+            val = await asyncio.get_event_loop().run_in_executor(None, AUTH_INPUT_QUEUE.get)
+            if val:
+                STATE["auth_step"] = "IDLE"
+                return val
+
     client = TelegramClient(
         "session", api_id, cfg["api_hash"],
         connection_retries=5, retry_delay=3,
@@ -187,12 +248,21 @@ async def _bot_main(cfg, accs, api_id):
         flood_sleep_threshold=60)
     BOT["client"] = client
 
-    log("🔌 Kết nối Telegram...", "info")
+    log("🔌 Kết nối Telegram thực tế...", "info")
     try:
-        await client.start()
+        # Thực hiện login real qua telethon interactive
+        await client.start(
+            phone=interactive_phone,
+            code=interactive_code,
+            password=interactive_password
+        )
+        me = await client.get_me()
+        STATE["tg_user"] = f"@{me.username}" if me.username else f"{me.first_name} ({me.phone})"
+        log(f"✅ Đăng nhập Telegram thành công với tài khoản: {STATE['tg_user']}", "ok")
     except Exception as e:
         log(f"❌ Telegram login fail: {e}", "err")
         STATE["running"] = False
+        STATE["auth_step"] = "IDLE"
         return
 
     username = TARGET_CHAT_LINK.rstrip("/").split("/")[-1].lstrip("@")
@@ -223,13 +293,14 @@ async def _bot_main(cfg, accs, api_id):
     STATE["chat_id"] = utils.get_peer_id(entity)
     log(f"🎯 Chat ID: {STATE['chat_id']}", "ok")
 
-    log(f"🔐 Đăng nhập {len(accs)} account LC79...", "info")
+    log(f"🔐 Đăng nhập và lấy số dư {len(accs)} account LC79...", "info")
     ok = 0
     for i, a in enumerate(accs):
         if a.login():
             ok += 1
             STATE["accounts"][i]["ok"] = True
-            log(f"[{a.nick}] ✅ JWT OK", "ok")
+            STATE["accounts"][i]["balance"] = a.balance
+            log(f"[{a.nick}] ✅ JWT OK — Số dư: {a.balance:,.0f} đ", "ok")
         else:
             log(f"[{a.nick}] ❌ login fail", "err")
     log(f"✅ {ok}/{len(accs)} account sẵn sàng", "ok")
@@ -270,6 +341,7 @@ async def _bot_main(cfg, accs, api_id):
         log(f"⚠️ Bot dừng: {e}", "err")
     finally:
         STATE["running"] = False
+        STATE["auth_step"] = "IDLE"
         log("🛑 Bot đã dừng", "warn")
 
 async def _catchup(client, entity):
@@ -300,7 +372,6 @@ async def _process_message(msg, force=False):
     if not m: return
 
     full = m.group(1).upper()
-    # 🎯 Bỏ 4 ký tự LC79 → PFKQWLHQH (thử trước), fallback full code
     candidates = []
     if full.startswith("LC79") and len(full) > 4:
         candidates.append(full[4:])
@@ -316,6 +387,11 @@ async def _process_message(msg, force=False):
     elapsed_ms = (time.time() - t0) * 1000
     lvl = "ok" if elapsed_ms < 1000 else "warn"
     log(f"⚡ Xong {len(candidates)} biến thể trong {elapsed_ms:.0f}ms (real API)", lvl)
+    
+    # Cập nhật lại số dư mới nhất vào STATE cho UI hiển thị
+    for i, a in enumerate(BOT["accounts"]):
+        if i < len(STATE["accounts"]):
+            STATE["accounts"][i]["balance"] = a.balance
 
 async def _redeem_all_parallel(candidates):
     """Redeem song song tất cả account × mọi biến thể code."""
@@ -393,7 +469,18 @@ def api_state():
         "accounts": STATE["accounts"],
         "stats": STATE["stats"],
         "latest_code": STATE["latest_code"],
+        "tg_user": STATE["tg_user"],
+        "auth_step": STATE["auth_step"],
+        "auth_prompt": STATE["auth_prompt"],
     })
+
+@app.route("/api/auth-input", methods=["POST"])
+def api_auth_input():
+    val = (request.json or {}).get("value", "").strip()
+    if val:
+        AUTH_INPUT_QUEUE.put(val)
+        return jsonify(ok=True, msg="Đã nhận giá trị")
+    return jsonify(ok=False, msg="Giá trị trống"), 400
 
 @app.route("/api/stream")
 def api_stream():
@@ -463,7 +550,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no,viewport-fit=cover" />
-<title>LC79 Auto Redeem</title>
+<title>LC79 Auto Redeem - Real Telegram Login</title>
 <style>
 *{box-sizing:border-box;-webkit-text-size-adjust:100%;text-size-adjust:100%}
 html,body{margin:0;padding:0;min-height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#0f1419;color:#e7e9ea;touch-action:pan-y;overflow-x:hidden}
@@ -515,6 +602,7 @@ body{padding:20px}
 @keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
 .acc-item .nick{font-weight:600}
 .acc-item .un{color:#8b98a5;font-size:12px;margin-top:2px}
+.acc-item .bal{color:#22c55e;font-weight:600;font-size:12.5px;margin-top:2px}
 .acc-item .del{background:transparent;border:1px solid #374151;color:#ef4444;width:28px;height:28px;border-radius:6px;cursor:pointer;font-size:14px;transition:all .2s}
 .acc-item .del:hover{background:rgba(239,68,68,.1);border-color:#ef4444}
 .acc-item .badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;margin-left:6px}
@@ -539,6 +627,16 @@ body{padding:20px}
 .toast.show{transform:translateX(-50%) translateY(0)}
 .toast.ok{border-color:#22c55e;background:#052e16;color:#86efac}
 .toast.err{border-color:#ef4444;background:#450a0a;color:#fca5a5}
+
+/* Modal nhập OTP Telegram Real */
+.modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.75);display:flex;align-items:center;justify-content:center;z-index:1000;opacity:0;pointer-events:none;transition:opacity .2s}
+.modal-overlay.active{opacity:1;pointer-events:auto}
+.modal-box{background:#1a2028;border:1px solid #374151;border-radius:16px;width:90%;max-width:400px;padding:24px;box-shadow:0 20px 40px rgba(0,0,0,.6)}
+.modal-box h3{margin:0 0 10px;font-size:18px;color:#2AABEE}
+.modal-box p{margin:0 0 16px;font-size:13.5px;color:#8b98a5;line-height:1.5}
+.modal-box input{width:100%;height:42px;padding:0 12px;background:#0f1419;border:1px solid #2d3644;border-radius:8px;color:#e7e9ea;font-size:15px;outline:none;margin-bottom:16px}
+.modal-box input:focus{border-color:#2AABEE}
+.modal-box button{width:100%;height:42px}
 </style>
 </head>
 <body>
@@ -548,7 +646,7 @@ body{padding:20px}
       <div class="logo-badge">🤖</div>
       <div class="title-wrap">
         <h1>LC79 Auto Redeem</h1>
-        <p>Telegram × LC79 — auto real API, không giả lập</p>
+        <p>Telegram Real Login & OTP × LC79 Live Balance</p>
       </div>
     </div>
     <div class="status-pill" id="statusPill">
@@ -565,7 +663,7 @@ body{padding:20px}
     <div class="stat ok"><div class="lbl">Thành công</div><div class="val" id="statOk">0</div></div>
     <div class="stat err"><div class="lbl">Thất bại</div><div class="val" id="statErr">0</div></div>
     <div class="stat info"><div class="lbl">Codes</div><div class="val" id="statCodes">0</div></div>
-    <div class="stat info"><div class="lbl">Accounts</div><div class="val" id="statAcc">0</div></div>
+    <div class="stat info"><div class="lbl">Telegram Account</div><div class="val" id="statTgUser" style="font-size:14px;font-weight:600">—</div></div>
     <div class="stat warn"><div class="lbl">Code gần nhất</div><div class="val" id="statLatest" style="font-size:16px">—</div></div>
     <div class="stat info"><div class="lbl">Group</div><div class="val" id="statGroup" style="font-size:15px">—</div></div>
   </div>
@@ -581,7 +679,7 @@ body{padding:20px}
         <div class="field"><label>Chat nguồn (cố định)</label><input id="chatLink" type="text" value="https://t.me/codelaucuagame" readonly /></div>
 
         <div style="display:flex;align-items:center;justify-content:space-between;margin:16px 0 8px;font-weight:600;font-size:14px">
-          <span>👥 Accounts (<span id="accCount">0</span>)</span>
+          <span>👥 LC79 Accounts (<span id="accCount">0</span>)</span>
         </div>
 
         <div class="row-2">
@@ -620,14 +718,25 @@ body{padding:20px}
   </div>
 </div>
 
+<!-- Modal yêu cầu nhập thông tin xác thực Telegram Real -->
+<div class="modal-overlay" id="authModal">
+  <div class="modal-box">
+    <h3 id="authTitle">Xác thực Telegram Real</h3>
+    <p id="authPromptText">Đang chờ thông tin...</p>
+    <input id="authInputVal" type="text" placeholder="Nhập vào đây..." autocomplete="off" />
+    <button class="btn btn-primary" id="btnSendAuth">Gửi đi</button>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
 (() => {
   const $ = id => document.getElementById(id);
-  const LS_KEY = 'lc79_config_v2';
+  const LS_KEY = 'lc79_config_v3';
   let state = { running:false, accounts:[] };
   let localAccounts = [];
+  let lastAuthStep = 'IDLE';
 
   function loadCfg() {
     try {
@@ -663,19 +772,23 @@ body{padding:20px}
   function renderAcc() {
     const list = $('accList');
     $('accCount').textContent = localAccounts.length;
-    $('statAcc').textContent = localAccounts.length;
     if (localAccounts.length === 0) {
       list.innerHTML = '<div class="empty">Chưa có account nào</div>';
       return;
     }
     list.innerHTML = localAccounts.map((a, i) => {
       const st = state.accounts[i];
-      const badge = st?.ok
+      const isOnline = st?.ok;
+      const badge = isOnline
         ? '<span class="badge ok">● Online</span>'
         : '<span class="badge off">○ Offline</span>';
+      const bal = isOnline && st.balance !== undefined 
+        ? '<div class="bal">💰 Số dư: ' + Number(st.balance).toLocaleString() + ' đ</div>' 
+        : '<div class="bal" style="color:#6b7280">💰 Số dư: —</div>';
+
       return '<div class="acc-item">' +
         '<div><div class="nick">' + escapeHtml(a.nick) + badge + '</div>' +
-        '<div class="un">' + escapeHtml(a.un) + '</div></div>' +
+        '<div class="un">' + escapeHtml(a.un) + '</div>' + bal + '</div>' +
         '<button class="del" data-idx="' + i + '" title="Xoá">✕</button>' +
         '</div>';
     }).join('');
@@ -759,6 +872,32 @@ body{padding:20px}
     await fetch('/api/clear-logs', { method:'POST' });
   });
 
+  // Xử lý gửi OTP/Phone lên server
+  $('btnSendAuth').addEventListener('click', async () => {
+    const val = $('authInputVal').value.trim();
+    if (!val) return toast('Vui lòng nhập giá trị', 'err');
+    try {
+      const res = await fetch('/api/auth-input', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: val })
+      });
+      const d = await res.json();
+      if (d.ok) {
+        $('authInputVal').value = '';
+        $('authModal').classList.remove('active');
+        toast('Đã gửi thông tin thành công', 'ok');
+      } else {
+        toast(d.msg, 'err');
+      }
+    } catch {
+      toast('Lỗi kết nối', 'err');
+    }
+  });
+  $('authInputVal').addEventListener('keydown', e => {
+    if (e.key === 'Enter') $('btnSendAuth').click();
+  });
+
   async function pollState() {
     try {
       const d = await (await fetch('/api/state')).json();
@@ -777,12 +916,42 @@ body{padding:20px}
       $('statErr').textContent = d.stats.fail;
       $('statCodes').textContent = d.stats.codes;
       $('statLatest').textContent = d.latest_code || '—';
+      $('statTgUser').textContent = d.tg_user || '—';
       $('statGroup').textContent = d.group_joined ? '✅ Joined' : (d.running ? '⏳ Joining' : '—');
+      
+      // Kiểm tra xem backend có đang cần hỏi thông tin đăng nhập Telegram Real không
+      if (d.auth_step && d.auth_step !== 'IDLE') {
+        if (lastAuthStep !== d.auth_step) {
+          lastAuthStep = d.auth_step;
+          $('authPromptText').textContent = d.auth_prompt;
+          if (d.auth_step === 'WAIT_PHONE') {
+            $('authTitle').textContent = '📲 Nhập Số Điện Thoại';
+            $('authInputVal').placeholder = '+84912345678';
+            $('authInputVal').type = 'text';
+          } else if (d.auth_step === 'WAIT_CODE') {
+            $('authTitle').textContent = '🔑 Nhập Mã OTP Telegram';
+            $('authInputVal').placeholder = '12345';
+            $('authInputVal').type = 'text';
+          } else if (d.auth_step === 'WAIT_PASSWORD') {
+            $('authTitle').textContent = '🔒 Nhập Mật Khẩu 2 Lớp (2FA)';
+            $('authInputVal').placeholder = 'Mật khẩu cloud...';
+            $('authInputVal').type = 'password';
+          }
+          $('authModal').classList.add('active');
+          $('authInputVal').focus();
+        }
+      } else {
+        if (lastAuthStep !== 'IDLE') {
+          lastAuthStep = 'IDLE';
+          $('authModal').classList.remove('active');
+        }
+      }
+
       renderAcc();
     } catch {}
   }
   pollState();
-  setInterval(pollState, 2500);
+  setInterval(pollState, 2000);
 
   function appendLog(e) {
     const body = $('logBody');
@@ -798,17 +967,6 @@ body{padding:20px}
     es.onmessage = ev => { try { appendLog(JSON.parse(ev.data)); } catch {} };
   }
 
-  document.addEventListener('keydown', e => {
-    if ((e.ctrlKey || e.metaKey) && ['+','-','=','0'].includes(e.key)) e.preventDefault();
-  });
-  let lastTouch = 0;
-  document.addEventListener('touchend', e => {
-    const now = Date.now();
-    if (now - lastTouch <= 300) e.preventDefault();
-    lastTouch = now;
-  }, { passive: false });
-  document.addEventListener('wheel', e => { if (e.ctrlKey) e.preventDefault(); }, { passive: false });
-
   loadCfg();
 })();
 </script>
@@ -819,11 +977,10 @@ body{padding:20px}
 # ==================== MAIN ====================
 if __name__ == "__main__":
     print("=" * 60)
-    print("🤖 LC79 Auto Redeem Tool — Real API (không giả lập)")
+    print("🤖 LC79 Auto Redeem Tool — Real API (Không giả lập)")
     print("=" * 60)
     print(f"🌐 Mở trình duyệt: http://localhost:{PORT}")
     print(f"📡 Group nguồn: {TARGET_CHAT_LINK}")
     print(f"🎯 Chat ID:     {TARGET_CHAT_HARD_ID}")
-    print("⚠️  Lần đầu chạy → Telethon sẽ hỏi SĐT + OTP trong terminal")
     print("=" * 60)
     app.run(host="0.0.0.0", port=PORT, threaded=True, debug=False)
