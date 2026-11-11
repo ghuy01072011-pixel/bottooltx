@@ -1,3 +1,4 @@
-python-telegram-bot==22.7
-flask==3.0.3
-requests==2.32.3
+Flask
+python-telegram-bot
+telethon
+requests
