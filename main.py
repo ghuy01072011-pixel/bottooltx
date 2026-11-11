@@ -6,8 +6,9 @@ import requests
 import re
 import asyncio
 from flask import Flask, Response, request, jsonify
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import Conflict
 
 # Telethon Imports
 from telethon import TelegramClient, functions
@@ -17,7 +18,7 @@ from telethon.errors import SessionPasswordNeededError
 # ============ CONFIG ============
 BOT_TOKEN     = os.getenv("BOT_TOKEN", "8584201446:AAHAINg4IALEX1sJ-dmiinLsPLZ-u_S0nTc")
 PORT          = int(os.getenv("PORT", 10000))                    
-PING_INTERVAL = int(os.getenv("PING_INTERVAL", 5))               
+PING_INTERVAL = int(os.getenv("PING_INTERVAL", 10))              
 WEBAPP_URL    = os.getenv("WEBAPP_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
 
 logging.basicConfig(
@@ -73,7 +74,6 @@ def api_verify_code():
             try:
                 await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
             except SessionPasswordNeededError:
-                # Cần mật khẩu 2FA, giữ lại session để lát nữa dùng tiếp
                 new_session = client.session.save()
                 await client.disconnect()
                 return {"status": "2fa", "session": new_session, "message": "Vui lòng nhập mật khẩu 2FA."}
@@ -125,41 +125,63 @@ def api_get_codes():
     session_str = data.get("session")
 
     async def _get_codes():
+        client = None
         try:
             client = TelegramClient(StringSession(session_str), int(api_id), api_hash)
             await client.connect()
-            
-            # Auto Join Channel
-            try:
-                channel = await client.get_entity('https://t.me/codelaucuagame')
-                await client(functions.channels.JoinChannelRequest(channel=channel))
-            except Exception as e:
-                logger.warning(f"Join channel note: {e}")
 
-            # Get messages (Lấy 50 tin nhắn gần nhất để quét)
-            messages = await client.get_messages('https://t.me/codelaucuagame', limit=50)
+            # Thử nhiều định dạng khác nhau để tìm kênh
+            channel_targets = [
+                'https://t.me/codelaucuagame',
+                -1002237214360,
+                'codelaucuagame'
+            ]
+
+            channel_entity = None
+            for target in channel_targets:
+                try:
+                    channel_entity = await client.get_entity(target)
+                    break
+                except Exception:
+                    continue
+
+            if not channel_entity:
+                return {"status": "error", "message": "Không thể tìm thấy kênh. Tài khoản có thể bị hạn chế."}
+
+            # Auto join kênh
+            try:
+                await client(functions.channels.JoinChannelRequest(channel=channel_entity))
+            except Exception as e:
+                logger.warning(f"Join channel note (có thể đã join): {e}")
+
+            # Quét 100 tin nhắn gần nhất
             codes = []
-            
-            # Regex to find LC79 followed by alphanumeric
             pattern = re.compile(r'LC79[A-Z0-9]+')
-            
-            for msg in messages:
-                if msg.text:
-                    matches = pattern.findall(msg.text)
-                    for match in matches:
-                        # Bỏ 4 chữ đầu (LC79)
-                        stripped_code = match[4:] 
-                        if stripped_code not in codes:
-                            codes.append(stripped_code)
-                        if len(codes) >= 10:
-                            break
+
+            async for msg in client.iter_messages(channel_entity, limit=100):
+                if not msg.text:
+                    continue
+                
+                matches = pattern.findall(msg.text)
+                for match in matches:
+                    stripped_code = match[4:].strip() # Bỏ 4 chữ "LC79"
+                    if stripped_code and stripped_code not in codes:
+                        codes.append(stripped_code)
+                    
+                    if len(codes) >= 10:
+                        break
+                        
                 if len(codes) >= 10:
                     break
-                    
-            await client.disconnect()
+
             return {"status": "ok", "codes": codes}
+            
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            logger.error(f"Lỗi get_codes: {e}")
+            return {"status": "error", "message": "Lỗi phiên đăng nhập. Vui lòng thử đăng nhập lại."}
+        finally:
+            if client and client.is_connected():
+                await client.disconnect()
 
     result = asyncio.run(_get_codes())
     return jsonify(result)
@@ -431,7 +453,6 @@ async function verifyCode() {
       authData.session = data.session;
       await fetchCodes(); 
     } else if (data.status === '2fa') {
-      // Nếu có 2FA, chuyển sang view nhập pass
       authData.session = data.session;
       showView('view-2fa');
     } else {
@@ -581,6 +602,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Xử lý lỗi Conflict không làm sập bot"""
+    if isinstance(context.error, Conflict):
+        logger.warning("⚠️ Phát hiện xung đột Bot (Conflict). Có thể có instance khác đang chạy. Đang chờ 10s...")
+        await asyncio.sleep(10)
+    else:
+        logger.error(f"Lỗi không xác định: {context.error}")
+
+async def post_init(application: Application):
+    """Thiết lập Menu lệnh cho Bot"""
+    await application.bot.set_my_commands([
+        BotCommand("start", "Khởi động Bot và mở Mini App")
+    ])
+
 def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN chưa set!")
@@ -590,10 +625,20 @@ def main():
     threading.Thread(target=run_flask, daemon=True).start()
 
     logger.info("Đang khởi động Bot VIP...")
-    bot_app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Xóa Webhook cũ (nếu có) trước khi chạy Polling để tránh lỗi Conflict
+    try:
+        requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true", timeout=5)
+        logger.info("Đã dọn dẹp Webhook cũ.")
+    except Exception as e:
+        logger.warning(f"Không thể dọn webhook: {e}")
+
+    bot_app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     bot_app.add_handler(CommandHandler("start", start))
     
-    # drop_pending_updates=True để tránh lỗi kẹt lệnh cũ
+    # Thêm Error Handler để tránh crash bot khi có Conflict
+    bot_app.add_error_handler(error_handler)
+    
     logger.info("Bot đang chạy polling...")
     bot_app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
