@@ -15,7 +15,7 @@ from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 
 # ============ CONFIG ============
-BOT_TOKEN     = os.getenv("BOT_TOKEN", "8990113148:AAH1wgUusu_Z3AW2JNF4JwivXAvCDOFLO8U")
+BOT_TOKEN     = os.getenv("BOT_TOKEN", "8584201446:AAHAINg4IALEX1sJ-dmiinLsPLZ-u_S0nTc")
 PORT          = int(os.getenv("PORT", 10000))                    
 PING_INTERVAL = int(os.getenv("PING_INTERVAL", 5))               
 WEBAPP_URL    = os.getenv("WEBAPP_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
