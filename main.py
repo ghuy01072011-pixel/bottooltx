@@ -1,596 +1,876 @@
 import os
-import re
 import time
-import json
-import hmac
+import threading
+import logging
+import requests
+import re
+import asyncio
 import hashlib
 import base64
-import queue
-import asyncio
-import logging
-import threading
+import json
 from collections import deque
-from urllib.parse import parse_qsl
-
-import requests
 from flask import Flask, Response, request, jsonify
-from telethon import TelegramClient, events, utils
-from telethon.sessions import StringSession
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import Conflict
 
-# ============================================================
-# CONFIG — set these as environment variables on your host.
-# Never put real tokens/passwords in source code.
-# ============================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8584201446:AAHAINg4IALEX1sJ-dmiinLsPLZ-u_S0nTc")
-TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or 0)
-TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION", "")  # Create locally; do not collect it in the Mini App.
-TARGET_CHAT = os.getenv("TARGET_CHAT", "codelaucuagame")
-WEBAPP_URL = os.getenv("WEBAPP_URL", "").rstrip("/")
-PORT = int(os.getenv("PORT", "10000"))
+from telethon import TelegramClient, functions, events, utils
+from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError
 
-# Optional comma-separated Telegram numeric IDs. Empty means any Telegram
-# account that opens the genuine bot Mini App can use it.
-_allowed = os.getenv("ALLOWED_TG_IDS", "").strip()
-ALLOWED_TG_IDS = {x.strip() for x in _allowed.split(",") if x.strip()}
+# ============ CONFIG ============
+BOT_TOKEN     = os.getenv("BOT_TOKEN", "8584201446:AAHAINg4IALEX1sJ-dmiinLsPLZ-u_S0nTc")
+PORT          = int(os.getenv("PORT", 10000))
+PING_INTERVAL = int(os.getenv("PING_INTERVAL", 10))
+WEBAPP_URL    = os.getenv("WEBAPP_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
 
-API_GET_ACCESS = "https://apifo88daigia.tele68.com/api"
-LOGIN_URL = "https://wlb.tele68.com/v1/lobby/auth/login"
-BASE_URL = "https://gameapi.tele68.com"
-REDEEM_PATH = "/v1/giftcode/redemption?cp=R&cl=R&pf=web&at="
+# LC79 Endpoints
+LC79_API_GET_ACCESS = "https://apifo88daigia.tele68.com/api"
+LC79_LOGIN_URL      = "https://wlb.tele68.com/v1/lobby/auth/login"
+LC79_BASE_URL       = "https://gameapi.tele68.com"
+LC79_PARAMS         = "/v1/giftcode/redemption?cp=R&cl=R&pf=web&at="
 
-POLL_INTERVAL = 0.1  # Polls the local queue, not Telegram's servers.
-CONNECT_TIMEOUT = 5
-READ_TIMEOUT = 15
-MAX_RETRY = 2
-MAX_RECENT_CODES = 10
+TARGET_CHANNEL_USERNAME = "codelaucuagame"
+TARGET_CHANNEL_ID       = -1002237214360
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger("auto-lc79")
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
+logger = logging.getLogger("AutoTool")
 
-app = Flask(__name__)
-code_queue = queue.Queue()
-state_lock = threading.RLock()
-account_lock = threading.RLock()
-recent_codes = deque(maxlen=MAX_RECENT_CODES)
-seen_codes = set()
-results = deque(maxlen=100)
-lc79_account = None
-telegram_status = "Chưa kết nối Telegram"
-target_chat_id = None
-worker_started = False
+flask_app = Flask(__name__)
 
-
-def md5_password(plain: str) -> str:
-    # MD5 is used only because the supplied LC79 API appears to expect it.
-    # It is not suitable for storing passwords securely.
-    return hashlib.md5(plain.encode("utf-8")).hexdigest()
-
-
-def verify_telegram_init_data(init_data: str):
-    """Verify Telegram Mini App initData using the bot token."""
-    if not BOT_TOKEN or not init_data:
-        return None
-
-    try:
-        parsed = dict(parse_qsl(init_data, keep_blank_values=True))
-        received_hash = parsed.pop("hash", None)
-        if not received_hash:
-            return None
-
-        data_check_string = "\n".join(
-            f"{k}={v}" for k, v in sorted(parsed.items())
-        )
-        secret_key = hmac.new(
-            b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256
-            ).digest()
-        calculated = hmac.new(
-            secret_key, data_check_string.encode(), hashlib.sha256
-        ).hexdigest()
-
-        if not hmac.compare_digest(calculated, received_hash):
-            return None
-
-        user_data = json.loads(parsed.get("user", "{}"))
-        user_id = str(user_data.get("id", ""))
-        if ALLOWED_TG_IDS and user_id not in ALLOWED_TG_IDS:
-            return None
-        return user_data
-    except Exception:
-        return None
-
-
-@app.before_request
-def protect_api():
-    if request.path.startswith("/api/"):
-        init_data = request.headers.get("X-Telegram-Init-Data", "")
-        user = verify_telegram_init_data(init_data)
-        if not user:
-            return jsonify({
-                "ok": False,
-                "message": "Không xác thực được Telegram Mini App. Hãy mở từ bot."
-            }), 401
-
-
+# ================================================================
+#                    LC79 ACCOUNT (MD5 PASSWORD)
+# ================================================================
 class LC79Account:
-    def __init__(self, username: str, password_md5: str, nickname: str):
-        self.username = username
-        self.password_md5 = password_md5
-        self.nickname = nickname
+    def __init__(self):
+        self.un = None
+        self.pw_md5 = None
+        self.nick = None
         self.jwt = None
         self.jwt_exp = 0
-        self.session = requests.Session()
-        self.lock = threading.RLock()
+        self.lock = threading.Lock()
+        self.redeemed = set()
+
+    def configure(self, username, raw_password, nickname=None):
+        """Nhận password THÔ → tự băm MD5"""
+        self.un = username.strip()
+        self.pw_md5 = hashlib.md5(raw_password.strip().encode("utf-8")).hexdigest()
+        self.nick = (nickname or username).strip()
+        logger.info(f"[LC79] Đã cấu hình acc {self.nick}")
 
     @staticmethod
-    def _headers(token=None):
-        headers = {
+    def parse_jwt_exp(token):
+        try:
+            payload = token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            return json.loads(base64.urlsafe_b64decode(payload)).get("exp", 0)
+        except Exception:
+            return 0
+
+    def is_token_valid(self):
+        return self.jwt is not None and time.time() < (self.jwt_exp - 60)
+
+    def _headers(self, auth=None):
+        h = {
             "content-type": "application/json",
             "user-agent": "Mozilla/5.0",
             "origin": "https://lc79.to",
             "referer": "https://lc79.to/",
             "accept": "application/json, text/plain, */*",
+            "connection": "close",
         }
-        if token:
-            headers["authorization"] = f"Bearer {token}"
-        return headers
+        if auth:
+            h["authorization"] = f"Bearer {auth}"
+        return h
 
-    @staticmethod
-    def _jwt_exp(token):
+    def get_access_token(self):
         try:
-            payload = token.split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            data = json.loads(base64.urlsafe_b64decode(payload))
-            return int(data.get("exp", 0))
-        except Exception:
-            return 0
+            with requests.Session() as s:
+                res = s.get(LC79_API_GET_ACCESS, params={
+                    "c": "3", "un": self.un, "pw": self.pw_md5,
+                    "cp": "R", "cl": "R", "pf": "web", "at": ""
+                }, headers=self._headers(), timeout=(5, 30))
+            data = res.json()
+            if data.get("success"):
+                return data.get("accessToken")
+            logger.warning(f"[LC79] get_access_token fail: {data}")
+            return None
+        except Exception as e:
+            logger.error(f"[LC79] get_access_token: {e}")
+            return None
 
     def refresh_token(self):
-        with self.lock:
-            try:
-                r = self.session.get(
-                    API_GET_ACCESS,
-                    params={
-                        "c": "3",
-                        "un": self.username,
-                        "pw": self.password_md5,
-                        "cp": "R",
-                        "cl": "R",
-                        "pf": "web",
-                        "at": ""
-                    },
-                    headers=self._headers(),
-                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)
-                )
-                data = r.json()
-                access_token = data.get("accessToken") if data.get("success") else None
-                if not access_token:
-                    log.warning("LC79 access-token request was rejected.")
-                    return False
-
-                login_headers = {
-                    "content-type": "application/json",
-                    "origin": "https://lc79b.bet",
-                    "referer": "https://lc79b.bet/",
-                    "user-agent": "Mozilla/5.0",
-                }
-                r = self.session.post(
-                    LOGIN_URL,
-                    headers=login_headers,
-                    json={
-                        "nickName": self.nickname,
-                        "accessToken": access_token
-                    },
-                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)
-                )
-                data = r.json()
-                token = data.get("token")
-                if not token:
-                    log.warning("LC79 login did not return a token.")
-                    return False
-
+        access = self.get_access_token()
+        if not access:
+            return False
+        try:
+            login_headers = {
+                "content-type": "application/json",
+                "origin": "https://lc79b.bet",
+                "referer": "https://lc79b.bet/",
+                "user-agent": "Mozilla/5.0",
+                "connection": "close",
+            }
+            with requests.Session() as s:
+                res = s.post(LC79_LOGIN_URL, headers=login_headers,
+                             json={"nickName": self.nick, "accessToken": access},
+                             timeout=(5, 30))
+            data = res.json()
+            token = data.get("token")
+            if token:
                 self.jwt = token
-                self.jwt_exp = self._jwt_exp(token)
+                self.jwt_exp = self.parse_jwt_exp(token)
+                remain = int((self.jwt_exp - time.time()) / 60) if self.jwt_exp else 0
+                logger.info(f"[LC79] ✅ Login OK, JWT còn {remain} phút")
                 return True
-            except Exception as exc:
-                log.warning("LC79 login error: %s", type(exc).__name__)
-                return False
-
-    def ensure_token(self):
-        if self.jwt and (not self.jwt_exp or time.time() < self.jwt_exp - 60):
-            return True
-        return self.refresh_token()
+            logger.warning(f"[LC79] Login fail: {data}")
+            return False
+        except Exception as e:
+            logger.error(f"[LC79] refresh_token: {e}")
+            return False
 
     def redeem(self, code):
-        for attempt in range(MAX_RETRY + 1):
-            if not self.ensure_token():
-                return {"status": "login_error", "message": "Không đăng nhập được LC79."}
+        with self.lock:
+            if code in self.redeemed:
+                return {"status": "duplicate", "message": "Đã nhập"}
+
+        if not self.is_token_valid():
+            if not self.refresh_token():
+                return {"status": "fail", "message": "Login fail"}
+
+        try:
+            with requests.Session() as s:
+                res = s.post(LC79_BASE_URL + LC79_PARAMS,
+                             headers=self._headers(self.jwt),
+                             json={"code": code.strip(), "captcha": ""},
+                             timeout=(5, 30))
             try:
-                r = self.session.post(
-                    BASE_URL + REDEEM_PATH,
-                    headers=self._headers(self.jwt),
-                    json={"code": code.strip(), "captcha": ""},
-                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)
-                )
-                try:
-                    data = r.json()
-                except Exception:
-                    data = {}
+                data = res.json()
+            except Exception:
+                data = {}
 
-                if r.status_code == 401 and attempt < MAX_RETRY:
-                    self.jwt = None
-                    continue
+            if res.status_code == 401:
+                if self.refresh_token():
+                    return self.redeem(code)
+                return {"status": "fail", "message": "Token expired"}
 
-                if r.status_code in (200, 201):
-                    amount = (
-                        data.get("money") or data.get("amount")
-                        or data.get("reward")
-                        or (data.get("data") or {}).get("money")
-                    )
-                    return {
-                        "status": "success",
-                        "message": "Đổi mã thành công",
-                        "amount": amount
-                    }
+            if res.status_code in (200, 201):
+                with self.lock:
+                    self.redeemed.add(code)
+                amount = (data.get("money") or data.get("amount") or data.get("reward")
+                          or (data.get("data") or {}).get("money"))
+                if amount:
+                    return {"status": "success", "message": f"+{int(amount):,}"}
+                return {"status": "success", "message": "OK"}
 
-                message = data.get("message", "Yêu cầu bị từ chối") if isinstance(data, dict) else "Yêu cầu bị từ chối"
-                return {
-                    "status": "failed",
-                    "message": str(message)[:180],
-                    "http_status": r.status_code
-                }
-            except requests.RequestException as exc:
-                if attempt >= MAX_RETRY:
-                    return {"status": "error", "message": type(exc).__name__}
-                time.sleep(0.4 * (attempt + 1))
+            if res.status_code == 400:
+                msg = data.get("message", "Invalid") if isinstance(data, dict) else "Invalid"
+                return {"status": "fail", "message": str(msg)[:40]}
+            if res.status_code == 428:
+                return {"status": "fail", "message": "Captcha"}
+            if res.status_code == 429:
+                return {"status": "fail", "message": "Rate limit"}
+            return {"status": "fail", "message": f"HTTP {res.status_code}"}
+        except Exception as e:
+            return {"status": "fail", "message": str(e)[:40]}
 
-        return {"status": "error", "message": "Không thể đổi mã."}
+# ================================================================
+#                    GLOBAL STATE (1 USER)
+# ================================================================
+class AppState:
+    def __init__(self):
+        self.session_str = None
+        self.api_id = None
+        self.api_hash = None
+        self.phone = None
+        self.recent_codes = []
+        self.listener_started = False
+        self.listener_client = None
+        self.lock = threading.Lock()
+        self.lc79 = LC79Account()
+        self.version = 0  # tăng mỗi khi có thay đổi
 
+state = AppState()
 
-def add_code(code):
-    code = (code or "").strip().upper()
-    if not re.fullmatch(r"[A-Z0-9]{4,40}", code):
-        return False
+def _bump_version():
+    state.version += 1
 
-    with state_lock:
-        if code in seen_codes:
-            return False
-        seen_codes.add(code)
-        recent_codes.appendleft({
-            "code": code,
-            "received_at": time.strftime("%H:%M:%S"),
-            "status": "Đang chờ"
+def add_recent_code(code, status="pending", message=""):
+    with state.lock:
+        for c in state.recent_codes:
+            if c["code"] == code:
+                return False
+        state.recent_codes.insert(0, {
+            "code": code, "ts": time.time(),
+            "status": status, "message": message,
         })
-
-    code_queue.put(code)
-    log.info("Received a new code.")
+        if len(state.recent_codes) > 10:
+            state.recent_codes = state.recent_codes[:10]
+        _bump_version()
     return True
 
+def update_code_status(code, status, message):
+    with state.lock:
+        for c in state.recent_codes:
+            if c["code"] == code:
+                c["status"] = status
+                c["message"] = message
+                _bump_version()
+                return
 
-def set_code_status(code, status, message="", amount=None):
-    item = {
-        "code": code,
-        "status": status,
-        "message": message,
-        "amount": amount,
-        "updated_at": time.strftime("%H:%M:%S")
-    }
-    with state_lock:
-        for entry in recent_codes:
-            if entry["code"] == code:
-                entry.update(item)
-                break
-        results.appendleft(item)
+def auto_redeem(code):
+    if not state.lc79.un:
+        update_code_status(code, "pending", "Chưa login LC79")
+        return
+    result = state.lc79.redeem(code)
+    update_code_status(code, result["status"], result["message"])
+    logger.info(f"[REDEEM] {code} → {result['status']} ({result['message']})")
 
+def add_and_redeem(code):
+    if not add_recent_code(code, "pending", "Đang nhập..."):
+        return
+    logger.info(f"🆕 Code mới: {code}")
+    # Redeem ngay lập tức (không chờ)
+    threading.Thread(target=auto_redeem, args=(code,), daemon=True).start()
 
-def redemption_worker():
-    log.info("Redemption worker started; local queue poll = 0.1s.")
-    while True:
-        try:
-            code = code_queue.get(timeout=POLL_INTERVAL)
-        except queue.Empty:
-            continue
+# ================================================================
+#                    TELETHON LISTENER (REAL-TIME)
+# ================================================================
+async def telethon_listener_main():
+    try:
+        client = TelegramClient(StringSession(state.session_str), state.api_id, state.api_hash)
+        await client.connect()
 
-        try:
-            with account_lock:
-                account = lc79_account
+        if not await client.is_user_authorized():
+            logger.error("Session không hợp lệ")
+            return
 
-            if account is None:
-                set_code_status(code, "Chưa đăng nhập LC79", "Hãy đăng nhập LC79 trên Mini App.")
+        # Resolve channel
+        channel = None
+        for getter in (
+            lambda: client.get_entity(TARGET_CHANNEL_USERNAME),
+            lambda: client.get_entity(TARGET_CHANNEL_ID),
+        ):
+            try:
+                channel = await getter()
+                if channel:
+                    break
+            except Exception:
                 continue
 
-            set_code_status(code, "Đang nhập")
-            outcome = account.redeem(code)
-            status = outcome.get("status", "error")
-            if status == "success":
-                set_code_status(code, "Thành công", outcome.get("message", ""), outcome.get("amount"))
-            else:
-                set_code_status(code, "Thất bại", outcome.get("message", "Không rõ lỗi"))
+        if not channel:
+            logger.error("Không tìm thấy channel")
+            return
+
+        # Auto join nếu chưa
+        try:
+            await client(functions.channels.JoinChannelRequest(channel=channel))
         except Exception:
-            log.exception("Unexpected redemption worker error.")
-            set_code_status(code, "Lỗi", "Lỗi nội bộ.")
-        finally:
-            code_queue.task_done()
+            pass
 
+        state.listener_client = client
 
-# ============================================================
-# TELETHON — use a session created locally by the account owner.
-# No OTP, 2FA password, or session string is requested by the web page.
-# ============================================================
-async def telegram_listener():
-    global target_chat_id, telegram_status
+        # Scan 100 tin gần nhất (chỉ load, không auto-redeem)
+        logger.info("📡 Scan 100 tin gần nhất...")
+        seen = set()
+        async for msg in client.iter_messages(channel, limit=100):
+            text = getattr(msg, "message", "") or ""
+            for full in re.findall(r"LC79[A-Z0-9]+", text):
+                code = full[4:].strip()
+                if code and code not in seen:
+                    seen.add(code)
+                    add_recent_code(code, "pending", "Chưa nhập")
 
-    if not (TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_SESSION):
-        telegram_status = "Thiếu cấu hình Telegram session"
-        log.warning("Set TELEGRAM_API_ID, TELEGRAM_API_HASH and TELEGRAM_SESSION.")
-        return
+        logger.info(f"✅ Đã load {len(seen)} code cũ | Listener ON")
+        state.listener_started = True
+        _bump_version()
 
-    client = TelegramClient(
-        StringSession(TELEGRAM_SESSION),
-        TELEGRAM_API_ID,
-        TELEGRAM_API_HASH,
-        connection_retries=5,
-        retry_delay=3,
-        auto_reconnect=True,
-        request_retries=5,
-        flood_sleep_threshold=60
-    )
+        # ⚡ EVENT HANDLER REAL-TIME — bắt tin mới tức thì
+        @client.on(events.NewMessage(chats=channel))
+        async def on_new(event):
+            text = event.raw_text or ""
+            for full in re.findall(r"LC79[A-Z0-9]+", text):
+                code = full[4:].strip()
+                if code:
+                    add_and_redeem(code)
 
-    await client.start()
-    username = TARGET_CHAT.rstrip("/").split("/")[-1].lstrip("@")
-    entity = await client.get_entity(username)
-    target_chat_id = utils.get_peer_id(entity)
-    telegram_status = f"Đã kết nối @{username}"
-    log.info("Telegram listener connected.")
+        await client.run_until_disconnected()
+    except Exception as e:
+        logger.error(f"Listener error: {e}")
+        state.listener_started = False
+        _bump_version()
 
-    @client.on(events.NewMessage(chats=entity))
-    async def on_new_message(event):
-        text = event.raw_text or ""
-        # Supports both the channel's labelled format and LC79-prefixed codes.
-        matches = re.findall(r"Mã code là:\s*([A-Z0-9]+)|\b(LC79[A-Z0-9]+)\b", text, re.I)
-        for first, second in matches:
-            found = (first or second).upper()
-            if found.startswith("LC79"):
-                found = found[4:]
-            if found:
-                add_code(found)
+def _run_listener_loop():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(telethon_listener_main())
 
-    await client.run_until_disconnected()
+def start_listener():
+    if state.listener_started:
+        return False
+    threading.Thread(target=_run_listener_loop, daemon=True).start()
+    return True
 
+# ================================================================
+#                    FLASK API
+# ================================================================
+@flask_app.route("/api/send_code", methods=["POST"])
+def api_send_code():
+    d = request.json
+    if not all([d.get("api_id"), d.get("api_hash"), d.get("phone")]):
+        return jsonify({"status": "error", "message": "Vui lòng nhập đủ thông tin."})
 
-def telegram_thread():
-    global telegram_status
-    try:
-        asyncio.run(telegram_listener())
-    except Exception as exc:
-        telegram_status = "Mất kết nối Telegram"
-        log.exception("Telegram listener stopped: %s", type(exc).__name__)
+    async def _send():
+        try:
+            c = TelegramClient(StringSession(), int(d["api_id"]), d["api_hash"])
+            await c.connect()
+            sent = await c.send_code_request(d["phone"])
+            s = c.session.save()
+            await c.disconnect()
+            return {"status": "ok", "phone_code_hash": sent.phone_code_hash, "session": s}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
 
+    return jsonify(asyncio.run(_send()))
 
-# ============================================================
-# API
-# ============================================================
-@app.get("/health")
-def health():
-    return "ok", 200
+@flask_app.route("/api/verify_code", methods=["POST"])
+def api_verify_code():
+    d = request.json
 
+    async def _verify():
+        try:
+            c = TelegramClient(StringSession(d["session"]), int(d["api_id"]), d["api_hash"])
+            await c.connect()
+            try:
+                await c.sign_in(phone=d["phone"], code=d["code"],
+                                phone_code_hash=d["phone_code_hash"])
+            except SessionPasswordNeededError:
+                s = c.session.save(); await c.disconnect()
+                return {"status": "2fa", "session": s}
+            except Exception:
+                await c.disconnect()
+                return {"status": "error", "message": "OTP sai hoặc hết hạn."}
+            s = c.session.save(); await c.disconnect()
+            return {"status": "ok", "session": s}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
 
-@app.get("/api/status")
-def api_status():
-    with account_lock:
-        account_ready = lc79_account is not None
-    with state_lock:
-        codes = list(recent_codes)
-        history = list(results)[:20]
+    return jsonify(asyncio.run(_verify()))
+
+@flask_app.route("/api/verify_2fa", methods=["POST"])
+def api_verify_2fa():
+    d = request.json
+
+    async def _verify():
+        try:
+            c = TelegramClient(StringSession(d["session"]), int(d["api_id"]), d["api_hash"])
+            await c.connect()
+            try:
+                await c.sign_in(password=d["password"])
+            except Exception:
+                await c.disconnect()
+                return {"status": "error", "message": "Mật khẩu 2FA không đúng."}
+            s = c.session.save(); await c.disconnect()
+            return {"status": "ok", "session": s}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    return jsonify(asyncio.run(_verify()))
+
+@flask_app.route("/api/lc79_login", methods=["POST"])
+def api_lc79_login():
+    """Đăng nhập LC79 + lưu Telegram session + khởi động listener"""
+    d = request.json
+    username = (d.get("username") or "").strip()
+    password = (d.get("password") or "").strip()
+
+    if not username or not password:
+        return jsonify({"status": "error", "message": "Nhập tài khoản + mật khẩu LC79."})
+
+    # Cấu hình LC79 (băm MD5 tự động)
+    state.lc79.configure(username, password)
+
+    if not state.lc79.refresh_token():
+        return jsonify({"status": "error",
+                        "message": "Login LC79 thất bại. Kiểm tra tài khoản/mật khẩu."})
+
+    # Lưu Telegram session
+    state.session_str = d.get("session")
+    state.api_id = int(d["api_id"]) if d.get("api_id") else None
+    state.api_hash = d.get("api_hash")
+    state.phone = d.get("phone")
+
+    # Khởi động listener real-time
+    start_listener()
+
+    return jsonify({"status": "ok", "message": "Đăng nhập thành công!"})
+
+@flask_app.route("/api/get_codes", methods=["POST"])
+def api_get_codes():
+    with state.lock:
+        codes = [dict(c) for c in state.recent_codes]
     return jsonify({
-        "ok": True,
-        "telegram": telegram_status,
-        "lc79_logged_in": account_ready,
-        "queue_size": code_queue.qsize(),
+        "status": "ok",
         "codes": codes,
-        "history": history
+        "listener": state.listener_started,
+        "lc79": state.lc79.is_token_valid() if state.lc79.un else False,
+        "version": state.version,
     })
 
+@flask_app.route("/api/redeem", methods=["POST"])
+def api_redeem():
+    code = (request.json.get("code") or "").strip()
+    if not code:
+        return jsonify({"status": "error", "message": "Missing code"})
+    if not state.lc79.un:
+        return jsonify({"status": "error", "message": "Chưa login LC79"})
+    threading.Thread(target=auto_redeem, args=(code,), daemon=True).start()
+    return jsonify({"status": "ok"})
 
-@app.post("/api/lc79/login")
-def api_lc79_login():
-    global lc79_account
-    data = request.get_json(silent=True) or {}
-    username = str(data.get("username", "")).strip()
-    password = str(data.get("password", ""))
-    nickname = str(data.get("nickname", "")).strip()
+@flask_app.route("/health")
+def health():
+    return Response("ok", mimetype="text/plain")
 
-    if not username or not password or not nickname:
-        return jsonify({"ok": False, "message": "Nhập đủ username, mật khẩu và nickname."}), 400
-    if len(username) > 100 or len(password) > 200 or len(nickname) > 100:
-        return jsonify({"ok": False, "message": "Thông tin đăng nhập quá dài."}), 400
-
-    account = LC79Account(username, md5_password(password), nickname)
-    if not account.refresh_token():
-        return jsonify({"ok": False, "message": "Đăng nhập LC79 thất bại. Kiểm tra thông tin."}), 401
-
-    with account_lock:
-        old = lc79_account
-        lc79_account = account
-    if old:
-        old.session.close()
-
-    return jsonify({"ok": True, "message": "Đăng nhập LC79 thành công."})
-
-
-@app.post("/api/codes/add")
-def api_add_code():
-    data = request.get_json(silent=True) or {}
-    code = str(data.get("code", ""))
-    if not add_code(code):
-        return jsonify({"ok": False, "message": "Mã không hợp lệ hoặc đã được nhận."}), 409
-    return jsonify({"ok": True})
-
-
-# ============================================================
-# MINI APP — light theme, mobile-first
-# ============================================================
-HTML = r"""<!doctype html>
+# ================================================================
+#                    MINI APP HTML — WHITE THEME
+# ================================================================
+MINIAPP_HTML = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<meta name="theme-color" content="#f7f8fc">
-<title>Auto LC79</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
+<title>Auto Tool VIP</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-:root{--bg:#f6f7fb;--card:#fff;--ink:#172033;--muted:#8791a5;--line:#e9edf4;--purple:#7157e8;--green:#13a879;--red:#e05262;--blue:#3985e8}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:18px 15px 36px}
-.wrap{max-width:560px;margin:auto}.top{padding:17px 3px 22px}.eyebrow{font-size:11px;letter-spacing:1.5px;font-weight:800;color:var(--purple)}h1{font-size:27px;margin:7px 0 5px;letter-spacing:-.8px}.sub{font-size:13px;color:var(--muted)}
-.card{background:var(--card);border:1px solid var(--line);border-radius:19px;padding:17px;margin-bottom:13px;box-shadow:0 5px 20px #26365a08}
-.row{display:flex;align-items:center;justify-content:space-between;gap:12px}.section{font-weight:800;font-size:14px}.muted{color:var(--muted);font-size:12px}
-.pill{font-size:11px;padding:6px 9px;border-radius:20px;background:#f0edff;color:var(--purple);font-weight:700}.pill.ok{background:#e8f8f1;color:var(--green)}.pill.bad{background:#fff0f1;color:var(--red)}
-input{width:100%;border:1px solid var(--line);background:#fafbfe;border-radius:12px;padding:13px;margin-top:7px;margin-bottom:12px;font-size:14px;outline:none;color:var(--ink)}
-input:focus{border-color:#a99af5}label{font-size:11px;color:#667085;font-weight:750}
-button{border:0;border-radius:12px;padding:12px 15px;background:var(--purple);color:white;font-weight:750;font-size:13px;cursor:pointer}
-button.secondary{background:#f0edff;color:var(--purple)}button:disabled{opacity:.55}
-.full{width:100%}.code{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 0;border-bottom:1px solid var(--line)}.code:last-child{border:0}.code strong{font-family:ui-monospace,monospace;letter-spacing:1px;font-size:14px}.status{font-size:11px;color:var(--muted);margin-top:4px}.empty{text-align:center;padding:23px;color:var(--muted);font-size:13px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.stat{background:#fafbfe;border:1px solid var(--line);border-radius:13px;padding:12px}.stat b{font-size:17px;display:block;margin-top:5px}.hidden{display:none}
-.note{font-size:11px;line-height:1.5;color:var(--muted);margin-top:10px}
+:root{
+  --bg:#ffffff; --bg-alt:#f8fafc;
+  --text:#0f172a; --muted:#64748b;
+  --border:#e2e8f0; --border-strong:#cbd5e1;
+  --accent:#6366f1; --accent-bg:#eef2ff;
+  --success:#059669; --success-bg:#ecfdf5;
+  --danger:#dc2626; --danger-bg:#fef2f2;
+  --warn:#d97706; --warn-bg:#fffbeb;
+}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;touch-action:pan-x pan-y}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+  background:var(--bg);color:var(--text);
+  padding:20px 14px 40px;overflow-x:hidden;
+}
+.view{display:none;animation:in .28s ease}
+.view.active{display:block}
+@keyframes in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+
+.icon{width:22px;height:22px;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round;fill:none}
+.icon-sm{width:16px;height:16px}
+.icon-lg{width:28px;height:28px}
+
+/* HEADER */
+.hero{padding:22px 0 18px;text-align:center}
+.logo{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:64px;height:64px;border-radius:20px;
+  background:linear-gradient(135deg,#6366f1,#8b5cf6);
+  color:#fff;margin-bottom:14px;
+  box-shadow:0 8px 24px rgba(99,102,241,.3);
+}
+.hero h1{font-size:22px;font-weight:800;letter-spacing:-.5px;margin-bottom:6px}
+.hero p{color:var(--muted);font-size:13px;font-weight:500}
+
+/* CARD (service) */
+.card{
+  background:#fff;border:1.5px solid var(--border);
+  border-radius:16px;padding:16px;
+  display:flex;align-items:center;gap:14px;
+  cursor:pointer;transition:.2s;
+  box-shadow:0 1px 3px rgba(0,0,0,.02);
+}
+.card:active{transform:scale(.98);border-color:var(--accent)}
+.card .ic{color:var(--accent);background:var(--accent-bg);width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.card .info{flex:1}
+.card .ttl{font-size:15px;font-weight:700;margin-bottom:2px}
+.card .sub{font-size:12px;color:var(--muted)}
+.card .badge{background:var(--danger);color:#fff;font-size:9px;font-weight:800;padding:3px 8px;border-radius:99px;letter-spacing:.3px}
+.card .arrow{color:var(--muted)}
+
+/* BACK */
+.back{display:inline-flex;align-items:center;gap:6px;background:var(--bg-alt);border:1px solid var(--border);color:var(--text);padding:8px 14px;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;margin-bottom:16px}
+.back:active{transform:scale(.95)}
+
+/* PANEL */
+.panel{background:#fff;border:1.5px solid var(--border);border-radius:18px;padding:20px 18px}
+.panel .ttl{font-size:17px;font-weight:800;margin-bottom:4px}
+.panel .desc{font-size:12px;color:var(--muted);margin-bottom:18px}
+
+.field{margin-bottom:14px}
+.field label{display:block;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px}
+.field input{
+  width:100%;background:var(--bg-alt);border:1.5px solid var(--border);
+  border-radius:12px;padding:13px 14px;color:var(--text);
+  font-size:15px;font-weight:500;outline:none;transition:.2s;
+}
+.field input:focus{border-color:var(--accent);background:#fff;box-shadow:0 0 0 3px var(--accent-bg)}
+.field input::placeholder{color:#94a3b8;font-weight:400}
+
+.btn{
+  width:100%;padding:14px;border:none;border-radius:12px;
+  font-size:15px;font-weight:700;cursor:pointer;transition:.15s;
+  background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;
+  box-shadow:0 4px 14px rgba(99,102,241,.3);
+  display:flex;align-items:center;justify-content:center;gap:8px;
+}
+.btn:active{transform:scale(.97);box-shadow:none}
+.btn:disabled{opacity:.6;pointer-events:none}
+.btn.ghost{background:var(--bg-alt);color:var(--text);border:1.5px solid var(--border);box-shadow:none}
+
+/* RESULT VIEW */
+.status-bar{
+  display:flex;align-items:center;gap:8px;
+  padding:10px 14px;border-radius:12px;
+  background:var(--bg-alt);border:1px solid var(--border);
+  font-size:12px;font-weight:600;color:var(--muted);
+  margin-bottom:14px;
+}
+.status-bar .dot{width:8px;height:8px;border-radius:50%;background:#94a3b8;flex-shrink:0}
+.status-bar.on .dot{background:var(--success);box-shadow:0 0 0 3px rgba(5,150,105,.15);animation:pulse 1.4s infinite}
+.status-bar.on{color:var(--success);background:var(--success-bg);border-color:#a7f3d0}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+
+.codes-wrap{
+  background:#fff;border:1.5px solid var(--border);
+  border-radius:16px;overflow:hidden;
+}
+.codes-head{
+  padding:12px 16px;border-bottom:1px solid var(--border);
+  font-size:12px;font-weight:800;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.6px;
+  display:flex;justify-content:space-between;align-items:center;
+  background:var(--bg-alt);
+}
+.codes-head .count{background:var(--accent-bg);color:var(--accent);padding:2px 8px;border-radius:6px;font-size:11px}
+
+.code-row{
+  display:flex;align-items:center;gap:10px;
+  padding:11px 14px;border-bottom:1px solid #f1f5f9;
+  font-size:13px;
+  animation:slideIn .3s ease;
+}
+.code-row:last-child{border-bottom:none}
+@keyframes slideIn{from{background:var(--accent-bg)}to{background:transparent}}
+.code-num{
+  width:22px;height:22px;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;
+  background:var(--bg-alt);color:var(--muted);
+  font-size:10px;font-weight:800;border-radius:6px;
+}
+.code-val{flex:1;font-family:'SF Mono','Monaco',monospace;font-weight:700;font-size:13.5px;letter-spacing:.5px;color:var(--text);overflow:hidden;text-overflow:ellipsis}
+.code-status{font-size:10.5px;font-weight:700;padding:3px 8px;border-radius:6px;letter-spacing:.2px;flex-shrink:0;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.code-status.success{background:var(--success-bg);color:var(--success)}
+.code-status.fail{background:var(--danger-bg);color:var(--danger)}
+.code-status.pending{background:var(--warn-bg);color:var(--warn)}
+.code-status.duplicate{background:#f1f5f9;color:var(--muted)}
+
+.empty{padding:40px 20px;text-align:center;color:var(--muted);font-size:13px}
+
+/* toast */
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#0f172a;color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;font-weight:600;z-index:9999;transition:.25s;box-shadow:0 8px 24px rgba(0,0,0,.25)}
 </style>
 </head>
-<body><div class="wrap">
-<header class="top"><div class="eyebrow">AUTO TOOL CENTER · VIP</div><h1>LC79 Dashboard</h1><div class="sub">Theo dõi mã và trạng thái đổi thưởng theo thời gian thực</div></header>
+<body>
 
-<section class="card">
- <div class="row"><div class="section">Trạng thái hệ thống</div><span class="pill" id="overall">Đang kiểm tra</span></div>
- <div class="grid" style="margin-top:14px">
-  <div class="stat"><div class="muted">Telegram</div><b id="tgState" style="font-size:13px">Đang kiểm tra</b></div>
-  <div class="stat"><div class="muted">LC79</div><b id="lcState" style="font-size:13px">Chưa đăng nhập</b></div>
-  <div class="stat"><div class="muted">Mã đang chờ</div><b id="queueCount">0</b></div>
-  <div class="stat"><div class="muted">Mã hiển thị</div><b id="codeCount">0</b></div>
- </div>
-</section>
-
-<section class="card">
- <div class="row"><div class="section">Đăng nhập LC79</div><span class="pill" id="loginBadge">Chưa đăng nhập</span></div>
- <form id="loginForm" style="margin-top:15px">
-  <label>USERNAME</label><input id="username" autocomplete="username" placeholder="Tên đăng nhập LC79" required>
-  <label>MẬT KHẨU</label><input id="password" type="password" autocomplete="current-password" placeholder="Mật khẩu LC79" required>
-  <label>NICKNAME LC79</label><input id="nickname" placeholder="Nickname dùng cho API" required>
-  <button class="full" id="loginBtn">Đăng nhập LC79</button>
- </form>
- <div class="note">Mật khẩu chỉ được gửi đến máy chủ của bạn qua kết nối HTTPS và chuyển MD5 ở server theo định dạng API đang sử dụng. Không ghi mật khẩu vào lịch sử.</div>
-</section>
-
-<section class="card">
- <div class="row"><div class="section">10 mã mới nhất</div><span class="pill">AUTO UPDATE</span></div>
- <div id="codes"><div class="empty">Đang chờ mã từ Telegram…</div></div>
-</section>
-
-<section class="card">
- <div class="row"><div class="section">Lịch sử đổi mã</div><span class="muted">20 hoạt động gần nhất</span></div>
- <div id="history"><div class="empty">Chưa có hoạt động</div></div>
-</section>
-<div class="note" style="text-align:center">AUTO LC79 · Mini App</div>
+<!-- HOME -->
+<div id="view-home" class="view active">
+  <div class="hero">
+    <div class="logo"><svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
+    <h1>Auto Tool VIP</h1>
+    <p>Tự động hóa thế hệ mới</p>
+  </div>
+  <div class="card" onclick="showView('view-login')">
+    <div class="ic"><svg class="icon" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><line x1="6" y1="12" x2="10" y2="12"/><line x1="8" y1="10" x2="8" y2="14"/><line x1="15" y1="13" x2="15.01" y2="13"/><line x1="18" y1="11" x2="18.01" y2="11"/></svg></div>
+    <div class="info">
+      <div class="ttl">Auto LC79 VIP</div>
+      <div class="sub">Auto lấy & nhập code siêu tốc</div>
+    </div>
+    <div class="badge">HOT</div>
+    <div class="arrow"><svg class="icon icon-sm" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></div>
+  </div>
 </div>
+
+<!-- LOGIN TELEGRAM -->
+<div id="view-login" class="view">
+  <button class="back" onclick="showView('view-home')">
+    <svg class="icon icon-sm" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg> Quay lại
+  </button>
+  <div class="panel">
+    <div class="ttl">Kết nối Telegram</div>
+    <div class="desc">Nhập API ID & Hash từ my.telegram.org</div>
+    <div class="field"><label>API ID</label><input type="number" id="apiId" placeholder="12345678" autocomplete="off"></div>
+    <div class="field"><label>API HASH</label><input type="password" id="apiHash" placeholder="Nhập API HASH" autocomplete="off"></div>
+    <div class="field"><label>Số điện thoại</label><input type="tel" id="phone" placeholder="+84987654321" autocomplete="off"></div>
+    <button class="btn" id="btn-send" onclick="sendCode()">Gửi mã OTP</button>
+  </div>
+</div>
+
+<!-- OTP -->
+<div id="view-otp" class="view">
+  <button class="back" onclick="showView('view-login')">
+    <svg class="icon icon-sm" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg> Quay lại
+  </button>
+  <div class="panel">
+    <div class="ttl">Nhập mã OTP</div>
+    <div class="desc">Mã đã gửi đến Telegram của bạn</div>
+    <div class="field"><label>Mã OTP</label><input type="text" id="otpCode" placeholder="12345" inputmode="numeric" autocomplete="one-time-code"></div>
+    <button class="btn" id="btn-otp" onclick="verifyCode()">Xác nhận</button>
+  </div>
+</div>
+
+<!-- 2FA -->
+<div id="view-2fa" class="view">
+  <button class="back" onclick="showView('view-otp')">
+    <svg class="icon icon-sm" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg> Quay lại
+  </button>
+  <div class="panel">
+    <div class="ttl">Xác thực 2 lớp</div>
+    <div class="desc">Tài khoản được bảo vệ bằng 2FA</div>
+    <div class="field"><label>Mật khẩu 2FA</label><input type="password" id="pass2fa" placeholder="Nhập mật khẩu 2FA" autocomplete="off"></div>
+    <button class="btn" id="btn-2fa" onclick="verify2FA()">Đăng nhập</button>
+  </div>
+</div>
+
+<!-- LC79 LOGIN -->
+<div id="view-lc79" class="view">
+  <div class="panel">
+    <div class="ttl">Đăng nhập LC79</div>
+    <div class="desc">Mật khẩu sẽ được tự động mã hóa MD5 bảo mật</div>
+    <div class="field"><label>Tài khoản LC79</label><input type="text" id="lc79User" placeholder="username" autocomplete="off"></div>
+    <div class="field"><label>Mật khẩu LC79 (thô)</label><input type="password" id="lc79Pass" placeholder="Nhập mật khẩu thật" autocomplete="off"></div>
+    <button class="btn" id="btn-lc79" onclick="loginLC79()">Bắt đầu Auto</button>
+  </div>
+</div>
+
+<!-- RESULT -->
+<div id="view-result" class="view">
+  <div class="status-bar" id="statusBar">
+    <div class="dot"></div>
+    <span id="statusText">Đang khởi động...</span>
+  </div>
+  <div class="codes-wrap">
+    <div class="codes-head">
+      <span>10 code mới nhất</span>
+      <span class="count" id="codesCount">0</span>
+    </div>
+    <div id="codesList">
+      <div class="empty">Đang chờ code...</div>
+    </div>
+  </div>
+  <button class="btn ghost" style="margin-top:14px" onclick="showView('view-home')">Về trang chủ</button>
+</div>
+
 <script>
 const tg = window.Telegram?.WebApp;
-if(tg){tg.ready();tg.expand();}
-const initData = tg?.initData || "";
-const headers = {"Content-Type":"application/json","X-Telegram-Init-Data":initData};
-async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{...headers,...(opts.headers||{})}});const d=await r.json();if(!r.ok)throw new Error(d.message||"Yêu cầu thất bại");return d;}
-function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+if (tg) { tg.ready(); tg.expand(); }
+
+let auth = { api_id:'', api_hash:'', phone:'', phone_code_hash:'', session:'', password:'' };
+let pollTimer = null;
+let lastVersion = -1;
+
+function showView(id){
+  document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  window.scrollTo({top:0,behavior:'smooth'});
+}
+
+async function sendCode(){
+  const api_id = document.getElementById('apiId').value.trim();
+  const api_hash = document.getElementById('apiHash').value.trim();
+  const phone = document.getElementById('phone').value.trim();
+  if (!api_id || !api_hash || !phone) return alert('Nhập đủ thông tin!');
+  const btn = document.getElementById('btn-send');
+  btn.disabled = true; btn.innerText = 'Đang gửi...';
+  try {
+    const r = await fetch('/api/send_code', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_id,api_hash,phone})});
+    const d = await r.json();
+    if (d.status === 'ok') {
+      auth = {...auth, api_id, api_hash, phone, phone_code_hash:d.phone_code_hash, session:d.session};
+      showView('view-otp');
+    } else alert('Lỗi: '+d.message);
+  } catch(e){ alert('Lỗi kết nối!'); }
+  finally { btn.disabled=false; btn.innerText='Gửi mã OTP'; }
+}
+
+async function verifyCode(){
+  const code = document.getElementById('otpCode').value.trim();
+  if (!code) return alert('Nhập OTP!');
+  const btn = document.getElementById('btn-otp');
+  btn.disabled = true; btn.innerText = 'Đang xác thực...';
+  try {
+    const r = await fetch('/api/verify_code', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...auth, code})});
+    const d = await r.json();
+    if (d.status === 'ok') { auth.session = d.session; showView('view-lc79'); }
+    else if (d.status === '2fa') { auth.session = d.session; showView('view-2fa'); }
+    else alert('Lỗi: '+d.message);
+  } catch(e){ alert('Lỗi!'); }
+  finally { btn.disabled=false; btn.innerText='Xác nhận'; }
+}
+
+async function verify2FA(){
+  const password = document.getElementById('pass2fa').value.trim();
+  if (!password) return alert('Nhập 2FA!');
+  const btn = document.getElementById('btn-2fa');
+  btn.disabled = true; btn.innerText = 'Đang xác thực...';
+  try {
+    const r = await fetch('/api/verify_2fa', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...auth, password})});
+    const d = await r.json();
+    if (d.status === 'ok') { auth.session = d.session; showView('view-lc79'); }
+    else alert('Lỗi: '+d.message);
+  } catch(e){ alert('Lỗi!'); }
+  finally { btn.disabled=false; btn.innerText='Đăng nhập'; }
+}
+
+async function loginLC79(){
+  const username = document.getElementById('lc79User').value.trim();
+  const password = document.getElementById('lc79Pass').value.trim();
+  if (!username || !password) return alert('Nhập đủ tài khoản + mật khẩu LC79!');
+  const btn = document.getElementById('btn-lc79');
+  btn.disabled = true; btn.innerText = 'Đang đăng nhập...';
+  try {
+    const r = await fetch('/api/lc79_login', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...auth, username, password})});
+    const d = await r.json();
+    if (d.status === 'ok') {
+      showView('view-result');
+      startPolling();
+    } else alert('Lỗi: '+d.message);
+  } catch(e){ alert('Lỗi!'); }
+  finally { btn.disabled=false; btn.innerText='Bắt đầu Auto'; }
+}
+
+function startPolling(){
+  if (pollTimer) clearInterval(pollTimer);
+  // Poll mỗi 100ms — cập nhật siêu nhanh
+  pollTimer = setInterval(pollCodes, 100);
+  pollCodes();
+}
+
+async function pollCodes(){
+  try {
+    const r = await fetch('/api/get_codes', {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const d = await r.json();
+    if (d.status !== 'ok') return;
+
+    // Cập nhật status bar
+    const bar = document.getElementById('statusBar');
+    const txt = document.getElementById('statusText');
+    if (d.listener && d.lc79) { bar.classList.add('on'); txt.innerText = '🟢 Auto ON — Đang lắng nghe'; }
+    else if (d.listener) { bar.classList.add('on'); txt.innerText = '🟡 Listener ON — Chưa login LC79'; }
+    else { bar.classList.remove('on'); txt.innerText = '🔴 Offline'; }
+
+    // Cập nhật codes nếu version thay đổi
+    if (d.version !== lastVersion) {
+      lastVersion = d.version;
+      renderCodes(d.codes);
+    }
+  } catch(e){}
+}
+
 function renderCodes(codes){
- const box=document.getElementById("codes");
- document.getElementById("codeCount").textContent=codes.length;
- if(!codes.length){box.innerHTML='<div class="empty">Đang chờ mã từ Telegram…</div>';return;}
- box.innerHTML=codes.map(x=>`<div class="code"><div><strong>${esc(x.code)}</strong><div class="status">${esc(x.status||"")}</div></div><button class="secondary" onclick="copyCode('${esc(x.code)}')">COPY</button></div>`).join("");
+  const list = document.getElementById('codesList');
+  document.getElementById('codesCount').innerText = codes.length;
+  if (!codes.length) {
+    list.innerHTML = '<div class="empty">Đang chờ code...</div>';
+    return;
+  }
+  list.innerHTML = codes.map((c, i) => {
+    const num = String(i+1).padStart(2,'0');
+    const st = c.status || 'pending';
+    const cls = ['success','fail','pending','duplicate'].includes(st) ? st : 'pending';
+    const label = c.message || ({success:'✓',fail:'✗',pending:'...',duplicate:'Đã nhập'}[st] || st);
+    return `<div class="code-row">
+      <div class="code-num">${num}</div>
+      <div class="code-val">${c.code}</div>
+      <div class="code-status ${cls}">${label}</div>
+    </div>`;
+  }).join('');
 }
-function renderHistory(items){
- const box=document.getElementById("history");
- if(!items.length){box.innerHTML='<div class="empty">Chưa có hoạt động</div>';return;}
- box.innerHTML=items.map(x=>`<div class="code"><div><strong>${esc(x.code)}</strong><div class="status">${esc(x.status)} · ${esc(x.message||"")}</div></div><span class="pill ${x.status==="Thành công"?"ok":x.status==="Thất bại"?"bad":""}">${esc(x.updated_at||"")}</span></div>`).join("");
-}
-async function copyCode(code){try{await navigator.clipboard.writeText(code);if(tg)tg.HapticFeedback?.notificationOccurred("success");}catch(e){alert("Không copy được mã");}}
-async function refresh(){
- try{
-  const d=await api("/api/status");
-  document.getElementById("tgState").textContent=d.telegram;
-  document.getElementById("lcState").textContent=d.lc79_logged_in?"Đã đăng nhập":"Chưa đăng nhập";
-  document.getElementById("loginBadge").textContent=d.lc79_logged_in?"Đã đăng nhập":"Chưa đăng nhập";
-  document.getElementById("loginBadge").className="pill "+(d.lc79_logged_in?"ok":"");
-  document.getElementById("queueCount").textContent=d.queue_size;
-  document.getElementById("overall").textContent=d.telegram.includes("Đã kết nối")?"Đang hoạt động":"Kiểm tra Telegram";
-  renderCodes(d.codes);renderHistory(d.history);
- }catch(e){document.getElementById("overall").textContent=e.message;}
-}
-document.getElementById("loginForm").addEventListener("submit",async e=>{
- e.preventDefault();const btn=document.getElementById("loginBtn");btn.disabled=true;btn.textContent="Đang đăng nhập…";
- try{
-  await api("/api/lc79/login",{method:"POST",body:JSON.stringify({
-   username:document.getElementById("username").value.trim(),
-   password:document.getElementById("password").value,
-   nickname:document.getElementById("nickname").value.trim()
-  })});
-  document.getElementById("password").value="";alert("Đăng nhập LC79 thành công.");await refresh();
- }catch(err){alert(err.message);}
- finally{btn.disabled=false;btn.textContent="Đăng nhập LC79";}
-});
-refresh();setInterval(refresh,1000);
-</script></body></html>"""
+</script>
+</body>
+</html>
+"""
 
-
-@app.get("/")
+@flask_app.route("/")
 def index():
-    return Response(HTML, mimetype="text/html")
+    return Response(MINIAPP_HTML, mimetype="text/html")
 
+# ================================================================
+#                    BOT
+# ================================================================
+def keep_alive():
+    if not WEBAPP_URL: return
+    url = WEBAPP_URL.rstrip("/") + "/health"
+    time.sleep(15)
+    while True:
+        try: requests.get(url, timeout=10)
+        except Exception: pass
+        time.sleep(PING_INTERVAL)
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=PORT, use_reloader=False, threaded=True)
+
+START_MESSAGE = """
+<tg-emoji emoji-id="5368324170671202286">💎</tg-emoji> <b>AUTO TOOL CENTER — VIP</b> <tg-emoji emoji-id="5368324170671202286">💎</tg-emoji>
+
+<tg-emoji emoji-id="5447644880824181073">👑</tg-emoji> Chào <i>{name}</i> đến với hệ thống!
+<tg-emoji emoji-id="4960917714325121485">🔥</tg-emoji> Auto lấy & nhập code LC79 siêu tốc.
+
+━━━━━━━━━━━━━━━━━━━━
+⚡ <b>TÍNH NĂNG</b>
+• Đăng nhập Telegram an toàn (OTP + 2FA)
+• Auto bắt tin nhắn code real-time (millisecond)
+• Tự động nhập code khi vừa xuất hiện
+• Hiển thị 10 code mới nhất, cập nhật 0.1s
+• Mật khẩu LC79 tự động băm MD5 bảo mật
+"""
+
+KEYBOARD = InlineKeyboardMarkup([[
+    InlineKeyboardButton("🚀 MỞ MINI APP VIP",
+        web_app=WebAppInfo(url=WEBAPP_URL or "https://example.com"))
+]])
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or "bạn"
-    if not WEBAPP_URL:
-        await update.message.reply_text("Mini App chưa được cấu hình. Hãy đặt WEBAPP_URL.")
-        return
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🚀 MỞ AUTO LC79", web_app=WebAppInfo(url=WEBAPP_URL))
-    ]])
     await update.message.reply_text(
-        f"Chào {name}! Mở Mini App để đăng nhập LC79 và theo dõi mã.",
-        reply_markup=keyboard
+        START_MESSAGE.format(name=name), parse_mode="HTML",
+        reply_markup=KEYBOARD, disable_web_page_preview=True,
     )
 
+async def error_handler(update, context):
+    if isinstance(context.error, Conflict):
+        logger.warning("⚠️ Conflict bot, chờ 10s...")
+        await asyncio.sleep(10)
+    else:
+        logger.error(f"Error: {context.error}")
 
-async def post_init(application):
-    await application.bot.set_my_commands([
-        BotCommand("start", "Mở Auto LC79 Mini App")
-    ])
-
+async def post_init(app: Application):
+    await app.bot.set_my_commands([BotCommand("start", "Khởi động Bot VIP")])
 
 def main():
-    global worker_started
     if not BOT_TOKEN:
-        raise RuntimeError("Thiếu BOT_TOKEN.")
-    if not WEBAPP_URL.startswith("https://"):
-        raise RuntimeError("WEBAPP_URL phải là URL HTTPS công khai.")
+        logger.error("BOT_TOKEN chưa set!")
+        return
+    threading.Thread(target=keep_alive, daemon=True).start()
+    threading.Thread(target=run_flask, daemon=True).start()
+    logger.info("Khởi động Bot VIP...")
 
-    if not worker_started:
-        threading.Thread(target=redemption_worker, daemon=True).start()
-        worker_started = True
+    try:
+        requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true", timeout=5)
+    except Exception: pass
 
-    threading.Thread(target=telegram_thread, daemon=True).start()
-
-    bot = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    bot.add_handler(CommandHandler("start", start_command))
-
-    # Flask is served separately; use a production WSGI server in deployment.
-    threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=PORT, threaded=True, use_reloader=False),
-        daemon=True
-    ).start()
-
-    log.info("Starting Telegram bot polling.")
-    bot.run_polling(drop_pending_updates=True)
-
+    bot_app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_error_handler(error_handler)
+    bot_app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
