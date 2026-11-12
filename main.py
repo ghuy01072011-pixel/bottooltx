@@ -30,6 +30,7 @@ GAME_API_URL     = os.getenv("GAME_API_URL", "https://apifo88daigia.tele68.com/a
 LOGIN_URL        = os.getenv("LOGIN_URL", "https://wlb.tele68.com/v1/lobby/auth/login")
 REDEEM_BASE_URL  = os.getenv("REDEEM_BASE_URL", "https://gameapi.tele68.com")
 REDEEM_PARAMS    = "/v1/giftcode/redemption?cp=R&cl=R&pf=web&at="
+PERSIST_FILE     = os.getenv("PERSIST_FILE", "sessions_store.json")
 
 SERVER_START_TIME = time.time()
 
@@ -177,21 +178,15 @@ class ApiLogger:
             else:
                 self.stats["failed"] += 1
             self.stats["total_elapsed"] += elapsed
-
         payload = {
-            "request_id": request_id,
-            "status": status,
+            "request_id": request_id, "status": status,
             "elapsed_ms": int(elapsed * 1000),
         }
-        if account:
-            payload["account"] = account
-        if headers:
-            payload["content_type"] = headers.get("Content-Type", "")
+        if account: payload["account"] = account
+        if headers: payload["content_type"] = headers.get("Content-Type", "")
         if body is not None:
             payload["body"] = self._redact_dict(body) if isinstance(body, dict) else body
-        if error:
-            payload["error"] = error
-
+        if error: payload["error"] = error
         level = "response" if 200 <= status < 300 else "error"
         self.log(level, f"HTTP {status} ({int(elapsed*1000)}ms)", **payload)
 
@@ -236,12 +231,10 @@ class ApiClient:
         attempt = 0
         last_error = None
         max_attempts = (self.max_retries + 1) if retry else 1
-
         while attempt < max_attempts:
             try:
                 resp = self.session.request(
-                    method=method, url=url,
-                    params=params, json=json_data,
+                    method=method, url=url, params=params, json=json_data,
                     headers=headers,
                     timeout=(self.connect_timeout, self.read_timeout),
                 )
@@ -257,8 +250,7 @@ class ApiClient:
                     headers=dict(resp.headers),
                 )
                 return {
-                    "ok": 200 <= resp.status_code < 300,
-                    "status": resp.status_code,
+                    "ok": 200 <= resp.status_code < 300, "status": resp.status_code,
                     "body": body, "text": resp.text,
                     "headers": dict(resp.headers),
                     "elapsed": elapsed, "request_id": rid,
@@ -275,11 +267,9 @@ class ApiClient:
                 self.logger.log("error", f"Request exception: {last_error}",
                                 request_id=rid, account=account)
                 break
-
             attempt += 1
             if attempt < max_attempts:
                 time.sleep(0.6 * attempt)
-
         return {
             "ok": False, "status": 0, "body": None, "text": "",
             "error": last_error or "unknown error",
@@ -506,7 +496,6 @@ _fast_session.headers.update({
 
 
 def _warm_redeem_connection():
-    """Pre-establish TCP+TLS tới game API. Giảm ~100-150ms lần redeem đầu."""
     try:
         _fast_session.head(REDEEM_BASE_URL, timeout=3, allow_redirects=False)
         logger.info("🔥 Redeem connection pre-warmed")
@@ -515,21 +504,19 @@ def _warm_redeem_connection():
 
 
 def code_variants(raw):
-    """Trả danh sách format của code để bắn song song (nếu có prefix)."""
     if not raw:
         return []
     raw = raw.strip().upper()
     if raw.startswith("LC79") and len(raw) > 4:
-        stripped = raw[4:].strip()
-        return [raw, stripped] if stripped else [raw]
+        s = raw[4:].strip()
+        return [raw, s] if s else [raw]
     if raw.endswith("LC79") and len(raw) > 4:
-        stripped = raw[:-4].strip()
-        return [raw, stripped] if stripped else [raw]
+        s = raw[:-4].strip()
+        return [raw, s] if s else [raw]
     return [raw]
 
 
 def extract_code_candidates(text):
-    """Trích mã thô từ tin nhắn. Trả về list raw code (chưa strip)."""
     if not text:
         return []
     out = []
@@ -544,12 +531,10 @@ def extract_code_candidates(text):
 
 
 def _single_redeem(account, code):
-    """Bắn 1 request redeem. Không retry. Dùng pre-warmed connection pool."""
     jwt = account.jwt
     if not jwt:
-        return {"status": "error", "http": 0,
-                "code": code, "message": "no JWT", "elapsed": 0}
-
+        return {"status": "error", "http": 0, "code": code,
+                "message": "no JWT", "elapsed": 0}
     headers = {
         "content-type": "application/json",
         "authorization": f"Bearer {jwt}",
@@ -558,8 +543,7 @@ def _single_redeem(account, code):
     try:
         resp = _fast_session.post(
             REDEEM_BASE_URL + REDEEM_PARAMS,
-            headers=headers,
-            json={"code": code, "captcha": ""},
+            headers=headers, json={"code": code, "captcha": ""},
             timeout=(3, 8),
         )
         elapsed = time.time() - start
@@ -569,10 +553,8 @@ def _single_redeem(account, code):
             body = {"raw_text": resp.text[:200]}
         return {
             "status": "ok" if 200 <= resp.status_code < 300 else "error",
-            "http": resp.status_code,
-            "body": body,
-            "code": code,
-            "elapsed": elapsed,
+            "http": resp.status_code, "body": body,
+            "code": code, "elapsed": elapsed,
         }
     except requests.exceptions.Timeout:
         return {"status": "error", "http": 0, "code": code,
@@ -583,19 +565,13 @@ def _single_redeem(account, code):
 
 
 def redeem_code_fast(account, candidates):
-    """
-    Fire tất cả candidates song song. Trả về kết quả đầu tiên thắng (200/201)
-    hoặc kết quả chậm nhất nếu tất cả fail.
-    """
     if not candidates:
         return {"status": "error", "http": 0, "message": "no candidates"}
-
     if not account.is_jwt_valid():
         r = account_manager.refresh_jwt(account)
         if r.get("status") != "ok":
             return {"status": "error", "http": 0,
                     "message": "JWT invalid: " + r.get("message", "")}
-
     if len(candidates) == 1:
         return _single_redeem(account, candidates[0])
 
@@ -614,10 +590,8 @@ def redeem_code_fast(account, candidates):
                 break
     finally:
         ex.shutdown(wait=False)
-
     if winner:
         return winner
-    # Trả về 1 kết quả bất kỳ (fail case)
     for f in futures:
         if f.done() and not f.cancelled():
             try:
@@ -627,10 +601,90 @@ def redeem_code_fast(account, candidates):
     return {"status": "error", "http": 0, "message": "all attempts failed"}
 
 
-# ============ TELEGRAM SESSION STORAGE ============
+# ================================================================
+#        PERSISTENT SESSION STORAGE (survive restart / reload)
+# ================================================================
+persistent_sessions = {}  # persist_token -> {...}
+PERSIST_LOCK = threading.Lock()
+
+
+def _load_persist():
+    global persistent_sessions
+    try:
+        if os.path.exists(PERSIST_FILE):
+            with open(PERSIST_FILE, "r") as f:
+                persistent_sessions = json.load(f)
+            logger.info(f"📂 Loaded {len(persistent_sessions)} persistent session(s)")
+    except Exception as e:
+        logger.warning(f"load_persist: {e}")
+        persistent_sessions = {}
+
+
+def _save_persist():
+    try:
+        with PERSIST_LOCK:
+            data = dict(persistent_sessions)
+        tmp = PERSIST_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, PERSIST_FILE)
+        try:
+            os.chmod(PERSIST_FILE, 0o600)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning(f"save_persist: {e}")
+
+
+def _update_persist(token, **fields):
+    if not token:
+        return
+    with PERSIST_LOCK:
+        if token in persistent_sessions:
+            persistent_sessions[token].update(fields)
+    _save_persist()
+
+
+def _create_persist_token(session_data):
+    """Gọi sau khi OTP/2FA thành công. Lưu StringSession + api_id/hash."""
+    try:
+        client = session_data["client"]
+        if not client.is_connected():
+            logger.warning("client not connected — cannot save session")
+            return None
+        session_string = client.session.save()
+    except Exception as e:
+        logger.warning(f"session.save fail: {e}")
+        return None
+
+    token = str(uuid.uuid4())
+    with PERSIST_LOCK:
+        persistent_sessions[token] = {
+            "session_string": session_string,
+            "api_id": session_data.get("api_id"),
+            "api_hash": session_data.get("api_hash"),
+            "phone": session_data.get("phone", ""),
+            "game_username": session_data.get("game_username"),
+            "game_pw_hash": None,
+            "game_nickname": None,
+            "game_vin": 0,
+            "game_xu": 0,
+            "access_token": None,
+            "access_token_time": 0,
+            "jwt": None,
+            "jwt_exp": 0,
+            "auto_enabled": False,
+            "created": time.time(),
+        }
+    _save_persist()
+    logger.info(f"💾 Persist token created: {token[:8]}")
+    return token
+
+
+# ============ TELEGRAM SESSION STORAGE (in-memory) ============
 sessions = {}
 SESSIONS_LOCK = threading.Lock()
-SESSION_TTL = 1800  # 30 phút (auto-watch cần giữ session lâu hơn)
+SESSION_TTL = 86400  # 24h — session có persist_token được giữ lâu hơn
 
 
 def cleanup_old_sessions():
@@ -641,7 +695,11 @@ def cleanup_old_sessions():
             expired_ids = []
             with SESSIONS_LOCK:
                 for sid, s in list(sessions.items()):
-                    if now - s["created"] > SESSION_TTL:
+                    # Session có persist_token → giữ vĩnh viễn (không xoá)
+                    if s.get("persist_token"):
+                        continue
+                    # Session tạm (chưa login xong) → xoá sau 1h
+                    if now - s["created"] > 3600:
                         expired_ids.append(sid)
             for sid in expired_ids:
                 with SESSIONS_LOCK:
@@ -651,12 +709,12 @@ def cleanup_old_sessions():
                         async_manager.run(s["client"].disconnect(), timeout=5)
                     except Exception:
                         pass
-                    logger.info(f"🧹 Cleaned session {sid[:8]}")
+                    logger.info(f"🧹 Cleaned temp session {sid[:8]}")
         except Exception as e:
             logger.warning(f"cleanup err: {e}")
 
 
-# ============ GAME LOGIN (SYNC) ============
+# ============ GAME LOGIN ============
 def login_game_sync(username, password):
     try:
         pw_hash = hashlib.md5(password.encode("utf-8")).hexdigest()
@@ -706,7 +764,8 @@ def login_game_sync(username, password):
                            account=username)
         return {"status": "ok", "username": nickname, "balance": vin, "xuTotal": xu,
                 "access_token_ready": bool(account.access_token),
-                "login_time": account.login_time}
+                "login_time": account.login_time,
+                "_pw_hash": pw_hash}
     except Exception as e:
         api_logger.log("error", f"login_game exception: {type(e).__name__}: {e}")
         return {"status": "error", "message": f"Lỗi kết nối: {e}"}
@@ -731,7 +790,6 @@ async def _async_fetch_codes(client, session_data):
                 break
     except Exception as e:
         _log("warning", f"iter_dialogs: {str(e)[:80]}")
-
     if not channel_entity:
         try:
             channel_entity = await client.get_entity('codelaucuagame')
@@ -749,7 +807,6 @@ async def _async_fetch_codes(client, session_data):
         return {"status": "error",
                 "message": "Không tìm thấy kênh LC79. Tài khoản chưa join hoặc kênh ẩn.",
                 "scan_log": scan_log}
-
     _log("success", "Đã resolve kênh LC79")
     try:
         await client(functions.channels.JoinChannelRequest(channel=channel_entity))
@@ -771,7 +828,6 @@ async def _async_fetch_codes(client, session_data):
             variants = code_variants(raw)
             if not variants:
                 continue
-            # Use first (stripped) variant as canonical ID
             canonical = variants[-1] if len(variants) > 1 else variants[0]
             if canonical in seen_in_scan:
                 continue
@@ -816,7 +872,7 @@ async def _async_fetch_codes(client, session_data):
 
 
 # ================================================================
-#                   AUTO-WATCH (REAL-TIME LISTENER)
+#                   AUTO-WATCH (REAL-TIME)
 # ================================================================
 def _add_auto_event(session_id, event):
     with SESSIONS_LOCK:
@@ -830,20 +886,17 @@ def _add_auto_event(session_id, event):
 
 
 def _auto_redeem_worker(session_id, candidates, raw_code, msg_ts):
-    """Thread: fire redeem ngay lập tức. Không block async loop."""
     try:
         with SESSIONS_LOCK:
             s = sessions.get(session_id)
         if not s:
             return
-
-        # Dedup
         redeemed = s.setdefault("redeemed_codes", [])
         if raw_code in redeemed:
             return
         redeemed.append(raw_code)
-        if len(redeemed) > 300:
-            s["redeemed_codes"] = redeemed[-300:]
+        if len(redeemed) > 500:
+            s["redeemed_codes"] = redeemed[-500:]
 
         username = s.get("game_username")
         if not username:
@@ -854,12 +907,11 @@ def _auto_redeem_worker(session_id, candidates, raw_code, msg_ts):
                 "delay_ms": int((time.time() - msg_ts) * 1000),
             })
             return
-
         account = account_manager.get(username)
         if not account:
             _add_auto_event(session_id, {
                 "ts": time.time(), "code": raw_code,
-                "status": "skipped", "message": "Không tìm thấy account",
+                "status": "skipped", "message": "Account không tồn tại",
                 "msg_ts": msg_ts,
                 "delay_ms": int((time.time() - msg_ts) * 1000),
             })
@@ -871,7 +923,6 @@ def _auto_redeem_worker(session_id, candidates, raw_code, msg_ts):
         result = redeem_code_fast(account, candidates)
         elapsed = time.time() - fire_ts
         total_elapsed = time.time() - msg_ts
-
         http = result.get("http", 0)
         body = result.get("body") or {}
         is_ok = http in (200, 201)
@@ -884,25 +935,38 @@ def _auto_redeem_worker(session_id, candidates, raw_code, msg_ts):
             msg = msg or body.get("message")
 
         _add_auto_event(session_id, {
-            "ts": fire_ts,
-            "msg_ts": msg_ts,
-            "code": raw_code,
-            "candidates": candidates,
-            "http": http,
+            "ts": fire_ts, "msg_ts": msg_ts, "code": raw_code,
+            "candidates": candidates, "http": http,
             "elapsed_ms": int(elapsed * 1000),
             "total_ms": int(total_elapsed * 1000),
             "delay_ms": int((fire_ts - msg_ts) * 1000),
             "status": "success" if is_ok else "fail",
-            "amount": amount,
-            "message": msg,
+            "amount": amount, "message": msg,
         })
-        api_logger.log(
-            "success" if is_ok else "error",
-            f"Redeem {raw_code}: HTTP {http} ({int(elapsed*1000)}ms)",
-            account=username,
-        )
+        api_logger.log("success" if is_ok else "error",
+                       f"Redeem {raw_code}: HTTP {http} ({int(elapsed*1000)}ms)",
+                       account=username)
     except Exception as e:
         logger.error(f"_auto_redeem_worker err: {e}")
+
+
+async def _async_resolve_channel(client, session_data=None):
+    channel = None
+    try:
+        async for dialog in client.iter_dialogs(limit=200):
+            if (dialog.entity and getattr(dialog.entity, 'username', '') == 'codelaucuagame') \
+               or dialog.id == -1002237214360:
+                channel = dialog.entity
+                break
+    except Exception:
+        pass
+    if not channel:
+        try: channel = await client.get_entity('codelaucuagame')
+        except Exception: pass
+    if not channel:
+        try: channel = await client.get_entity(-1002237214360)
+        except Exception: pass
+    return channel
 
 
 async def _async_start_auto_watch(session_id):
@@ -916,12 +980,10 @@ async def _async_start_auto_watch(session_id):
     username = s.get("game_username")
     if not username:
         return {"status": "error", "message": "Chưa login game — không thể bật auto"}
-
     account = account_manager.get(username)
     if not account:
         return {"status": "error", "message": "Không tìm thấy account"}
 
-    # Pre-warm JWT trước khi bật
     if not account.is_jwt_valid():
         r = account_manager.refresh_jwt(account)
         if r.get("status") != "ok":
@@ -935,21 +997,7 @@ async def _async_start_auto_watch(session_id):
         except Exception as e:
             return {"status": "error", "message": f"Mất kết nối: {e}"}
 
-    channel_entity = None
-    try:
-        async for dialog in client.iter_dialogs(limit=200):
-            if (dialog.entity and getattr(dialog.entity, 'username', '') == 'codelaucuagame') \
-               or dialog.id == -1002237214360:
-                channel_entity = dialog.entity
-                break
-    except Exception:
-        pass
-    if not channel_entity:
-        try: channel_entity = await client.get_entity('codelaucuagame')
-        except Exception: pass
-    if not channel_entity:
-        try: channel_entity = await client.get_entity(-1002237214360)
-        except Exception: pass
+    channel_entity = await _async_resolve_channel(client)
     if not channel_entity:
         return {"status": "error", "message": "Không tìm thấy kênh LC79"}
 
@@ -981,7 +1029,7 @@ async def _async_start_auto_watch(session_id):
     s["auto_watch_channel"] = channel_entity
 
     threading.Thread(target=_warm_redeem_connection, daemon=True).start()
-    logger.info(f"🎯 Auto-watch ON cho session {session_id[:8]} / {username}")
+    logger.info(f"🎯 Auto-watch ON: {session_id[:8]} / {username}")
     return {"status": "ok", "username": username}
 
 
@@ -999,12 +1047,58 @@ async def _async_stop_auto_watch(session_id):
         pass
     s["auto_watch_handler"] = None
     s["auto_watch_channel"] = None
-    logger.info(f"🛑 Auto-watch OFF cho session {session_id[:8]}")
+    logger.info(f"🛑 Auto-watch OFF: {session_id[:8]}")
     return {"status": "ok"}
 
 
+async def _async_force_scan(session_id):
+    """Quét 20 tin gần nhất, fire các code chưa redeem."""
+    with SESSIONS_LOCK:
+        s = sessions.get(session_id)
+    if not s:
+        return {"status": "error", "message": "Session hết hạn"}
+    username = s.get("game_username")
+    if not username:
+        return {"status": "error", "message": "Chưa login game"}
+    if not account_manager.get(username):
+        return {"status": "error", "message": "Account không tồn tại"}
+
+    client = s["client"]
+    if not client.is_connected():
+        try:
+            await client.connect()
+        except Exception as e:
+            return {"status": "error", "message": f"Mất kết nối: {e}"}
+
+    channel_entity = s.get("auto_watch_channel") or await _async_resolve_channel(client)
+    if not channel_entity:
+        return {"status": "error", "message": "Không tìm thấy kênh"}
+
+    redeemed = s.setdefault("redeemed_codes", [])
+    fired = []
+    now = time.time()
+
+    async for msg in client.iter_messages(channel_entity, limit=20):
+        text = msg.message or ""
+        for raw in extract_code_candidates(text):
+            if raw in redeemed:
+                continue
+            variants = code_variants(raw)
+            threading.Thread(
+                target=_auto_redeem_worker,
+                args=(session_id, variants, raw, now),
+                daemon=True,
+            ).start()
+            fired.append(raw)
+
+    logger.info(f"🔔 Force scan: fired {len(fired)} code")
+    return {"status": "ok", "fired": len(fired), "codes": fired}
+
+
+# ================================================================
+#                    BACKGROUND WORKERS
+# ================================================================
 def jwt_prewarm_loop():
-    """Background: refresh JWT cho các session auto-watch khi gần hết hạn."""
     time.sleep(20)
     while True:
         try:
@@ -1024,11 +1118,17 @@ def jwt_prewarm_loop():
                 if not acc or not acc.jwt_exp:
                     continue
                 remain = acc.jwt_exp - time.time()
-                if remain < 300:  # <5 phút → refresh
+                if remain < 300:
                     try:
                         r = account_manager.refresh_jwt(acc)
                         if r.get("status") == "ok":
-                            logger.info(f"🔄 Pre-warmed JWT for {username}")
+                            logger.info(f"🔄 Pre-warmed JWT: {username}")
+                            pt = s.get("persist_token")
+                            if pt:
+                                _update_persist(pt,
+                                    access_token=acc.access_token,
+                                    access_token_time=acc.access_token_time,
+                                    jwt=acc.jwt, jwt_exp=acc.jwt_exp)
                         else:
                             logger.warning(f"Prewarm fail {username}: {r.get('message')}")
                     except Exception as e:
@@ -1037,10 +1137,89 @@ def jwt_prewarm_loop():
             logger.error(f"jwt_prewarm_loop: {e}")
 
 
+def session_keepalive_loop():
+    """Reconnect client nếu auto-watch session bị mất kết nối."""
+    time.sleep(30)
+    while True:
+        try:
+            time.sleep(60)
+            with SESSIONS_LOCK:
+                active = [(sid, s) for sid, s in sessions.items()
+                          if s.get("auto_watch_handler")]
+            for sid, s in active:
+                client = s.get("client")
+                if not client:
+                    continue
+                try:
+                    if not client.is_connected():
+                        async_manager.run(client.connect(), timeout=20)
+                        logger.info(f"♻️ Reconnected {sid[:8]}")
+                except Exception as e:
+                    logger.warning(f"reconnect fail {sid[:8]}: {e}")
+        except Exception as e:
+            logger.error(f"session_keepalive: {e}")
+
+
+def restore_persistent_sessions_loop():
+    """Restore mọi session có auto_enabled khi server khởi động lại."""
+    time.sleep(10)
+    with PERSIST_LOCK:
+        items = [(t, dict(p)) for t, p in persistent_sessions.items() if p.get("auto_enabled")]
+    if not items:
+        logger.info("♻️ No persistent sessions to restore")
+        return
+    logger.info(f"♻️ Restoring {len(items)} persistent session(s)...")
+    for token, p in items:
+        try:
+            async def _restore(token=token, p=p):
+                client = TelegramClient(
+                    StringSession(p["session_string"]),
+                    int(p["api_id"]), p["api_hash"]
+                )
+                await client.connect()
+                if not await client.is_user_authorized():
+                    logger.warning(f"session {token[:8]} unauthorized")
+                    return None
+                if p.get("game_username") and p.get("game_pw_hash"):
+                    acc = account_manager.get_or_create(
+                        p["game_username"], p["game_pw_hash"],
+                        p.get("game_nickname") or p["game_username"],
+                        p.get("game_vin", 0), p.get("game_xu", 0),
+                    )
+                    acc.access_token = p.get("access_token")
+                    acc.access_token_time = p.get("access_token_time", 0)
+                    acc.jwt = p.get("jwt")
+                    acc.jwt_exp = p.get("jwt_exp", 0)
+                new_sid = str(uuid.uuid4())
+                with SESSIONS_LOCK:
+                    sessions[new_sid] = {
+                        "client": client,
+                        "phone": p.get("phone", ""),
+                        "phone_code_hash": None,
+                        "created": time.time(),
+                        "codes_seen": {}, "scan_log": [],
+                        "game_username": p.get("game_username"),
+                        "auto_events": [], "redeemed_codes": [],
+                        "auto_watch_handler": None,
+                        "persist_token": token,
+                        "api_id": p.get("api_id"),
+                        "api_hash": p.get("api_hash"),
+                    }
+                try:
+                    await _async_start_auto_watch(new_sid)
+                except Exception as e:
+                    logger.warning(f"auto-watch restore fail {token[:8]}: {e}")
+                return new_sid
+            new_sid = async_manager.run(_restore(), timeout=90)
+            if new_sid:
+                logger.info(f"♻️ Restored {token[:8]} -> {new_sid[:8]}")
+        except Exception as e:
+            logger.warning(f"restore {token[:8]} fail: {e}")
+
+
 # ================================================================
 #                    API ENDPOINTS
 # ================================================================
-
 @flask_app.route("/api/send_code", methods=["POST"])
 def api_send_code():
     data = request.json or {}
@@ -1067,6 +1246,8 @@ def api_send_code():
                     "game_username": None,
                     "auto_events": [], "redeemed_codes": [],
                     "auto_watch_handler": None,
+                    "persist_token": None,
+                    "api_id": int(api_id), "api_hash": api_hash,
                 }
             logger.info(f"📱 Session {session_id[:8]} created for {phone}")
             return {"status": "ok", "session_id": session_id}
@@ -1121,7 +1302,11 @@ def api_verify_code():
                                  phone_code_hash=s["phone_code_hash"])
             logger.info(f"✅ OTP OK session {session_id[:8]}")
             s["phone_code_hash"] = None
-            return {"status": "ok"}
+            # Tạo persist_token ngay (không cần 2FA)
+            persist_token = _create_persist_token(s)
+            if persist_token:
+                s["persist_token"] = persist_token
+            return {"status": "ok", "persist_token": persist_token}
         except SessionPasswordNeededError:
             return {"status": "2fa"}
         except PhoneCodeInvalidError:
@@ -1165,7 +1350,10 @@ def api_verify_2fa():
         try:
             await client.sign_in(password=password)
             logger.info(f"✅ 2FA OK session {session_id[:8]}")
-            return {"status": "ok"}
+            persist_token = _create_persist_token(s)
+            if persist_token:
+                s["persist_token"] = persist_token
+            return {"status": "ok", "persist_token": persist_token}
         except Exception as e:
             logger.warning(f"2FA fail: {type(e).__name__}: {e}")
             return {"status": "error", "message": "Mật khẩu 2FA không đúng."}
@@ -1183,15 +1371,34 @@ def api_login_game():
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
     session_id = data.get("session_id")
+    persist_token = data.get("persist_token")
     if not username or not password:
         return jsonify({"status": "error",
                         "message": "Vui lòng nhập đủ Username và Mật khẩu."})
     result = login_game_sync(username, password)
-    if result.get("status") == "ok" and session_id:
-        with SESSIONS_LOCK:
-            s = sessions.get(session_id)
-        if s:
-            s["game_username"] = username
+
+    if result.get("status") == "ok":
+        pw_hash = result.pop("_pw_hash", None)
+        # Link vào session in-memory
+        if session_id:
+            with SESSIONS_LOCK:
+                s = sessions.get(session_id)
+            if s:
+                s["game_username"] = username
+                if not s.get("persist_token") and persist_token:
+                    s["persist_token"] = persist_token
+        # Link vào persistent
+        if persist_token:
+            acc = account_manager.get(username)
+            _update_persist(persist_token,
+                game_username=username,
+                game_pw_hash=pw_hash,
+                game_nickname=result.get("username"),
+                game_vin=result.get("balance", 0),
+                game_xu=result.get("xuTotal", 0),
+                access_token=acc.access_token if acc else None,
+                access_token_time=acc.access_token_time if acc else 0,
+            )
     return jsonify(result)
 
 
@@ -1240,43 +1447,288 @@ def _require_session_account(session_id):
 
 @flask_app.route("/api/get_access_token", methods=["POST"])
 def api_get_access_token():
-    _, acc, err = _require_session_account((request.json or {}).get("session_id"))
+    data = request.json or {}
+    s, acc, err = _require_session_account(data.get("session_id"))
     if err:
         return jsonify(err)
-    return jsonify(account_manager.get_access_token(acc))
+    result = account_manager.get_access_token(acc)
+    if result.get("status") == "ok" and s and s.get("persist_token"):
+        _update_persist(s["persist_token"],
+            access_token=acc.access_token,
+            access_token_time=acc.access_token_time)
+    return jsonify(result)
 
 
 @flask_app.route("/api/get_jwt", methods=["POST"])
 def api_get_jwt():
     data = request.json or {}
-    _, acc, err = _require_session_account(data.get("session_id"))
+    s, acc, err = _require_session_account(data.get("session_id"))
     if err:
         return jsonify(err)
-    return jsonify(account_manager.get_jwt(acc, force=bool(data.get("force"))))
+    result = account_manager.get_jwt(acc, force=bool(data.get("force")))
+    if result.get("status") == "ok" and s and s.get("persist_token"):
+        _update_persist(s["persist_token"],
+            access_token=acc.access_token,
+            access_token_time=acc.access_token_time,
+            jwt=acc.jwt, jwt_exp=acc.jwt_exp)
+    return jsonify(result)
 
 
 @flask_app.route("/api/refresh_jwt", methods=["POST"])
 def api_refresh_jwt():
-    _, acc, err = _require_session_account((request.json or {}).get("session_id"))
+    data = request.json or {}
+    s, acc, err = _require_session_account(data.get("session_id"))
     if err:
         return jsonify(err)
-    return jsonify(account_manager.refresh_jwt(acc))
+    result = account_manager.refresh_jwt(acc)
+    if result.get("status") == "ok" and s and s.get("persist_token"):
+        _update_persist(s["persist_token"],
+            access_token=acc.access_token,
+            access_token_time=acc.access_token_time,
+            jwt=acc.jwt, jwt_exp=acc.jwt_exp)
+    return jsonify(result)
 
 
-@flask_app.route("/api/account_status", methods=["POST"])
-def api_account_status():
-    _, acc, err = _require_session_account((request.json or {}).get("session_id"))
-    if err:
-        return jsonify(err)
+# ==================== PERSIST / RESUME ====================
+
+@flask_app.route("/api/resume", methods=["POST"])
+def api_resume():
+    """Khôi phục phiên từ persist_token (localStorage client)."""
+    data = request.json or {}
+    persist_token = data.get("persist_token")
+    if not persist_token:
+        return jsonify({"status": "error", "message": "Thiếu persist_token"})
+    with PERSIST_LOCK:
+        p = persistent_sessions.get(persist_token)
+    if not p:
+        return jsonify({"status": "not_found", "message": "Token không tồn tại"})
+
+    # Reuse nếu đã có session active
+    with SESSIONS_LOCK:
+        active_sid = None
+        for sid, s in sessions.items():
+            if s.get("persist_token") == persist_token:
+                client = s.get("client")
+                try:
+                    if client and client.is_connected():
+                        active_sid = sid
+                        break
+                except Exception:
+                    continue
+
+    if active_sid:
+        sid = active_sid
+    else:
+        async def _do():
+            try:
+                client = TelegramClient(
+                    StringSession(p["session_string"]),
+                    int(p["api_id"]), p["api_hash"]
+                )
+                await client.connect()
+                if not await client.is_user_authorized():
+                    return {"status": "expired"}
+                # Restore account
+                if p.get("game_username") and p.get("game_pw_hash"):
+                    acc = account_manager.get_or_create(
+                        p["game_username"], p["game_pw_hash"],
+                        p.get("game_nickname") or p["game_username"],
+                        p.get("game_vin", 0), p.get("game_xu", 0),
+                    )
+                    acc.access_token = p.get("access_token")
+                    acc.access_token_time = p.get("access_token_time", 0)
+                    acc.jwt = p.get("jwt")
+                    acc.jwt_exp = p.get("jwt_exp", 0)
+
+                new_sid = str(uuid.uuid4())
+                with SESSIONS_LOCK:
+                    sessions[new_sid] = {
+                        "client": client,
+                        "phone": p.get("phone", ""),
+                        "phone_code_hash": None,
+                        "created": time.time(),
+                        "codes_seen": {}, "scan_log": [],
+                        "game_username": p.get("game_username"),
+                        "auto_events": [], "redeemed_codes": [],
+                        "auto_watch_handler": None,
+                        "persist_token": persist_token,
+                        "api_id": p.get("api_id"),
+                        "api_hash": p.get("api_hash"),
+                    }
+                return {"status": "ok", "session_id": new_sid}
+            except Exception as e:
+                logger.error(f"resume err: {e}")
+                return {"status": "error", "message": str(e)}
+
+        try:
+            result = async_manager.run(_do(), timeout=45)
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)})
+        if result.get("status") != "ok":
+            return jsonify(result)
+        sid = result["session_id"]
+
+    # Auto-watch restore nếu đã bật
+    if p.get("auto_enabled") and p.get("game_username"):
+        try:
+            async_manager.run(_async_start_auto_watch(sid), timeout=30)
+        except Exception as e:
+            logger.warning(f"resume auto-watch fail: {e}")
+
+    # Build response
+    with SESSIONS_LOCK:
+        s = sessions.get(sid) or {}
+    acc = account_manager.get(p.get("game_username")) if p.get("game_username") else None
+
     return jsonify({
-        "status": "ok", "username": acc.username, "nickname": acc.nickname,
-        "vin": acc.vin, "xu": acc.xu, "login_time": acc.login_time,
-        "access_token_ready": bool(acc.access_token),
-        "access_token_time": acc.access_token_time,
-        "jwt_ready": bool(acc.jwt), "jwt_valid": acc.is_jwt_valid(),
-        "jwt_exp": acc.jwt_exp,
-        "jwt_expires_in_minutes": acc.jwt_remaining_minutes(),
+        "status": "ok",
+        "session_id": sid,
+        "persist_token": persist_token,
+        "game_username": p.get("game_username"),
+        "nickname": p.get("game_nickname"),
+        "vin": p.get("game_vin", 0),
+        "xu": p.get("game_xu", 0),
+        "login_time": acc.login_time if acc else 0,
+        "access_token_ready": bool(acc and acc.access_token),
+        "jwt_ready": bool(acc and acc.jwt),
+        "jwt_valid": acc.is_jwt_valid() if acc else False,
+        "jwt_exp": acc.jwt_exp if acc else 0,
+        "jwt_expires_in_minutes": acc.jwt_remaining_minutes() if acc else 0,
+        "auto_enabled": bool(s.get("auto_watch_handler")),
     })
+
+
+@flask_app.route("/api/forget", methods=["POST"])
+def api_forget():
+    """Xoá persistent session (đăng xuất thiết bị)."""
+    data = request.json or {}
+    persist_token = data.get("persist_token")
+    session_id = data.get("session_id")
+    if not persist_token:
+        return jsonify({"status": "error", "message": "Thiếu persist_token"})
+
+    # Disconnect + remove in-memory
+    to_remove = []
+    with SESSIONS_LOCK:
+        for sid, s in sessions.items():
+            if s.get("persist_token") == persist_token or sid == session_id:
+                to_remove.append(sid)
+    for sid in to_remove:
+        with SESSIONS_LOCK:
+            s = sessions.pop(sid, None)
+        if s and s.get("client"):
+            try:
+                async_manager.run(s["client"].disconnect(), timeout=10)
+            except Exception:
+                pass
+
+    with PERSIST_LOCK:
+        persistent_sessions.pop(persist_token, None)
+    _save_persist()
+    logger.info(f"🚪 Forgot persist_token {persist_token[:8]}")
+    return jsonify({"status": "ok"})
+
+
+# ==================== MANUAL / AUTO / FORCE ====================
+
+@flask_app.route("/api/redeem_manual", methods=["POST"])
+def api_redeem_manual():
+    data = request.json or {}
+    session_id = data.get("session_id")
+    code_input = (data.get("code") or "").strip().upper()
+    if not session_id or not code_input:
+        return jsonify({"status": "error", "message": "Thiếu session hoặc code"})
+    with SESSIONS_LOCK:
+        s = sessions.get(session_id)
+    if not s:
+        return jsonify({"status": "error", "message": "Session hết hạn"})
+    username = s.get("game_username")
+    if not username:
+        return jsonify({"status": "error", "message": "Chưa login game"})
+    acc = account_manager.get(username)
+    if not acc:
+        return jsonify({"status": "error", "message": "Không tìm thấy account"})
+
+    variants = code_variants(code_input)
+    start = time.time()
+    result = redeem_code_fast(acc, variants)
+    elapsed = time.time() - start
+    http = result.get("http", 0)
+    body = result.get("body") or {}
+    is_ok = http in (200, 201)
+    amount = (body.get("money") or body.get("amount")
+              or body.get("reward")
+              or (body.get("data") or {}).get("money")) if isinstance(body, dict) else None
+    msg = body.get("message") if isinstance(body, dict) else result.get("message")
+
+    _add_auto_event(session_id, {
+        "ts": time.time(), "code": code_input, "candidates": variants,
+        "http": http, "elapsed_ms": int(elapsed * 1000),
+        "status": "success" if is_ok else "fail",
+        "amount": amount, "message": msg, "manual": True,
+    })
+    return jsonify({**result, "amount": amount})
+
+
+@flask_app.route("/api/toggle_auto", methods=["POST"])
+def api_toggle_auto():
+    data = request.json or {}
+    session_id = data.get("session_id")
+    enabled = bool(data.get("enabled"))
+    if not session_id:
+        return jsonify({"status": "error", "message": "Thiếu session"})
+    with SESSIONS_LOCK:
+        if session_id not in sessions:
+            return jsonify({"status": "error", "message": "Session hết hạn"})
+    try:
+        if enabled:
+            result = async_manager.run(_async_start_auto_watch(session_id), timeout=30)
+        else:
+            result = async_manager.run(_async_stop_auto_watch(session_id), timeout=15)
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Server: {e}"})
+    if result.get("status") == "ok":
+        with SESSIONS_LOCK:
+            s = sessions.get(session_id)
+        pt = s.get("persist_token") if s else None
+        if pt:
+            _update_persist(pt, auto_enabled=enabled)
+    return jsonify(result)
+
+
+@flask_app.route("/api/auto_status", methods=["POST"])
+def api_auto_status():
+    data = request.json or {}
+    session_id = data.get("session_id")
+    if not session_id:
+        return jsonify({"status": "error", "message": "Thiếu session"})
+    with SESSIONS_LOCK:
+        s = sessions.get(session_id)
+    if not s:
+        return jsonify({"status": "error", "message": "Session hết hạn"})
+    username = s.get("game_username")
+    acc = account_manager.get(username) if username else None
+    return jsonify({
+        "status": "ok",
+        "enabled": bool(s.get("auto_watch_handler")),
+        "events": s.get("auto_events", [])[-25:],
+        "jwt_ready": bool(acc and acc.is_jwt_valid()),
+        "jwt_remaining_minutes": acc.jwt_remaining_minutes() if acc else 0,
+    })
+
+
+@flask_app.route("/api/force_scan", methods=["POST"])
+def api_force_scan():
+    """Nút 'Nhắc tool check code' — quét 20 tin gần nhất, fire code chưa redeem."""
+    data = request.json or {}
+    session_id = data.get("session_id")
+    if not session_id:
+        return jsonify({"status": "error", "message": "Thiếu session"})
+    try:
+        result = async_manager.run(_async_force_scan(session_id), timeout=30)
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
+    return jsonify(result)
 
 
 @flask_app.route("/api/check_api", methods=["POST"])
@@ -1341,90 +1793,6 @@ def api_stats():
 
 
 # ================================================================
-#           NEW: MANUAL REDEEM + AUTO-WATCH ENDPOINTS
-# ================================================================
-@flask_app.route("/api/redeem_manual", methods=["POST"])
-def api_redeem_manual():
-    data = request.json or {}
-    session_id = data.get("session_id")
-    code_input = (data.get("code") or "").strip().upper()
-    captcha = data.get("captcha", "")
-    if not session_id or not code_input:
-        return jsonify({"status": "error", "message": "Thiếu session hoặc code"})
-    with SESSIONS_LOCK:
-        s = sessions.get(session_id)
-    if not s:
-        return jsonify({"status": "error", "message": "Session hết hạn"})
-    username = s.get("game_username")
-    if not username:
-        return jsonify({"status": "error", "message": "Chưa login game"})
-    acc = account_manager.get(username)
-    if not acc:
-        return jsonify({"status": "error", "message": "Không tìm thấy account"})
-
-    variants = code_variants(code_input)
-    start = time.time()
-    result = redeem_code_fast(acc, variants)
-    elapsed = time.time() - start
-    http = result.get("http", 0)
-    body = result.get("body") or {}
-    is_ok = http in (200, 201)
-    amount = (body.get("money") or body.get("amount")
-              or body.get("reward")
-              or (body.get("data") or {}).get("money")) if isinstance(body, dict) else None
-    msg = body.get("message") if isinstance(body, dict) else result.get("message")
-
-    _add_auto_event(session_id, {
-        "ts": time.time(), "code": code_input, "candidates": variants,
-        "http": http, "elapsed_ms": int(elapsed * 1000),
-        "status": "success" if is_ok else "fail",
-        "amount": amount, "message": msg, "manual": True,
-    })
-    return jsonify({**result, "amount": amount})
-
-
-@flask_app.route("/api/toggle_auto", methods=["POST"])
-def api_toggle_auto():
-    data = request.json or {}
-    session_id = data.get("session_id")
-    enabled = bool(data.get("enabled"))
-    if not session_id:
-        return jsonify({"status": "error", "message": "Thiếu session"})
-    with SESSIONS_LOCK:
-        if session_id not in sessions:
-            return jsonify({"status": "error", "message": "Session hết hạn"})
-    try:
-        if enabled:
-            result = async_manager.run(_async_start_auto_watch(session_id), timeout=30)
-        else:
-            result = async_manager.run(_async_stop_auto_watch(session_id), timeout=15)
-    except Exception as e:
-        return jsonify({"status": "error", "message": f"Server: {e}"})
-    return jsonify(result)
-
-
-@flask_app.route("/api/auto_status", methods=["POST"])
-def api_auto_status():
-    data = request.json or {}
-    session_id = data.get("session_id")
-    if not session_id:
-        return jsonify({"status": "error", "message": "Thiếu session"})
-    with SESSIONS_LOCK:
-        s = sessions.get(session_id)
-    if not s:
-        return jsonify({"status": "error", "message": "Session hết hạn"})
-    username = s.get("game_username")
-    acc = account_manager.get(username) if username else None
-    return jsonify({
-        "status": "ok",
-        "enabled": bool(s.get("auto_watch_handler")),
-        "events": s.get("auto_events", [])[-25:],
-        "jwt_ready": bool(acc and acc.is_jwt_valid()),
-        "jwt_remaining_minutes": acc.jwt_remaining_minutes() if acc else 0,
-    })
-
-
-# ================================================================
 #                    WEB UI
 # ================================================================
 MAIN_HTML = r"""<!DOCTYPE html>
@@ -1445,15 +1813,7 @@ MAIN_HTML = r"""<!DOCTYPE html>
 }
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html,body{touch-action:pan-x pan-y;height:100%}
-body{
-  font-family:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,sans-serif;
-  background:var(--bg);color:var(--text);min-height:100vh;
-  padding:20px 16px 60px;overflow-x:hidden;
-  background-image:
-    radial-gradient(circle at 0% 0%,rgba(139,92,246,0.15) 0%,transparent 50%),
-    radial-gradient(circle at 100% 100%,rgba(6,182,212,0.15) 0%,transparent 50%);
-  background-attachment:fixed;
-}
+body{font-family:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding:20px 16px 60px;overflow-x:hidden;background-image:radial-gradient(circle at 0% 0%,rgba(139,92,246,0.15) 0%,transparent 50%),radial-gradient(circle at 100% 100%,rgba(6,182,212,0.15) 0%,transparent 50%);background-attachment:fixed}
 body>*{position:relative;z-index:1}
 .icon{width:24px;height:24px;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;fill:none}
 .icon-sm{width:18px;height:18px}
@@ -1488,6 +1848,7 @@ body>*{position:relative;z-index:1}
 .btn-ghost{background:rgba(255,255,255,0.05);border:1px solid var(--border);box-shadow:none}
 .btn-danger{background:linear-gradient(135deg,#ef4444,#dc2626);box-shadow:0 8px 24px rgba(239,68,68,0.4)}
 .btn-success{background:linear-gradient(135deg,#10b981,#059669);box-shadow:0 8px 24px rgba(16,185,129,0.4)}
+.btn-warning{background:linear-gradient(135deg,#f59e0b,#d97706);box-shadow:0 8px 24px rgba(245,158,11,0.4)}
 .alert{padding:14px 16px;border-radius:12px;font-size:13px;font-weight:600;margin-bottom:16px;display:none;line-height:1.5}
 .alert.show{display:block}
 .alert-err{background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#fca5a5}
@@ -1538,8 +1899,6 @@ body>*{position:relative;z-index:1}
 .log-error{color:#f87171}.log-request{color:#a78bfa}.log-response{color:#94a3b8}
 .log-time{color:#64748b;margin-right:6px}
 .log-tag{font-weight:800;margin-right:6px}
-
-/* AUTO-REDEEM section */
 .auto-section{border:1px solid rgba(6,182,212,0.3);background:linear-gradient(135deg,rgba(6,182,212,0.08),rgba(139,92,246,0.05));border-radius:20px;padding:16px;margin-bottom:16px}
 .auto-toggle-row{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px}
 .auto-info{flex:1;min-width:0}
@@ -1548,13 +1907,11 @@ body>*{position:relative;z-index:1}
 .auto-btn{flex-shrink:0;padding:10px 20px;font-size:12px;font-weight:800;border-radius:10px;cursor:pointer;font-family:inherit;transition:0.2s;border:none}
 .auto-btn[data-state="on"]{background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff;box-shadow:0 4px 12px rgba(239,68,68,0.3)}
 .auto-btn[data-state="off"]{background:linear-gradient(135deg,#10b981,#059669);color:#fff;box-shadow:0 4px 12px rgba(16,185,129,0.3)}
-
-/* Manual redeem */
 .manual-panel{background:linear-gradient(135deg,rgba(245,158,11,0.08),rgba(239,68,68,0.05));border:1px solid rgba(245,158,11,0.3);border-radius:20px;padding:16px;margin-bottom:16px}
 .manual-panel input{margin-bottom:10px;padding:14px}
 .manual-panel button{padding:14px;font-size:15px}
-
-/* Auto log */
+.force-panel{background:linear-gradient(135deg,rgba(6,182,212,0.1),rgba(139,92,246,0.05));border:1px solid rgba(6,182,212,0.4);border-radius:20px;padding:16px;margin-bottom:16px}
+.force-panel p{font-size:11px;color:var(--muted);line-height:1.6;margin-bottom:10px}
 .auto-log{max-height:240px;overflow-y:auto;font-size:12px;line-height:1.6}
 .auto-log .event{padding:8px 10px;border-radius:8px;margin-bottom:6px;border-left:3px solid transparent}
 .auto-log .event.success{background:rgba(16,185,129,0.08);border-left-color:#10b981}
@@ -1562,9 +1919,11 @@ body>*{position:relative;z-index:1}
 .auto-log .event.skipped{background:rgba(148,163,184,0.08);border-left-color:#94a3b8}
 .auto-log .event .ev-code{font-family:'Courier New',monospace;font-weight:800;color:#34d399;font-size:13px}
 .auto-log .event .ev-meta{color:var(--muted);font-size:10px;margin-top:2px}
-
 .footer{text-align:center;color:var(--muted);font-size:12px;margin-top:40px;font-weight:500}
 .footer a{color:var(--accent2);text-decoration:none}
+.session-banner{background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);border-radius:12px;padding:10px 14px;font-size:11px;color:#6ee7b7;margin-bottom:16px;display:none}
+.session-banner.show{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.session-banner button{background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;padding:6px 10px;border-radius:8px;font-size:10px;font-weight:700;cursor:pointer;font-family:inherit}
 </style>
 </head>
 <body>
@@ -1581,8 +1940,9 @@ body>*{position:relative;z-index:1}
       <div style="font-size:52px;margin-bottom:16px">🎮</div>
       <div style="font-size:16px;font-weight:700;margin-bottom:8px">Tool Auto LC79</div>
       <div style="font-size:13px;color:var(--muted);margin-bottom:24px;line-height:1.6">
-        Đăng nhập Telegram → Đăng nhập game → Nhận code, nhập code siêu nhanh<br>
-        <strong style="color:var(--accent2)">⚡ Auto-watch: fire code trong ~0.1-0.3s</strong>
+        Đăng nhập 1 lần — dùng mãi mãi<br>
+        <strong style="color:var(--accent2)">⚡ Auto-watch: fire code trong ~0.1-0.3s</strong><br>
+        <strong style="color:var(--success)">💾 Session được lưu tự động</strong>
       </div>
     </div>
     <button class="btn" onclick="startFlow()">🚀 Bắt Đầu</button>
@@ -1596,7 +1956,7 @@ body>*{position:relative;z-index:1}
   <div class="lc-header">
     <div class="lc-icon"><svg class="icon icon-lg" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
     <h2>Xác Thực Telegram</h2>
-    <p>Kết nối tài khoản Telegram của bạn</p>
+    <p>Đăng nhập 1 lần — lưu lại dùng tiếp</p>
   </div>
   <div class="steps" id="steps1"></div>
   <div class="panel">
@@ -1651,7 +2011,7 @@ body>*{position:relative;z-index:1}
   <div class="lc-header" style="border-color:rgba(6,182,212,0.3)">
     <div class="lc-icon" style="color:var(--accent2);background:rgba(6,182,212,0.1);border-color:rgba(6,182,212,0.3)"><svg class="icon icon-lg" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 12h4m-2-2v4"/></svg></div>
     <h2>Đăng Nhập Game LC79</h2>
-    <p>Xem số dư + nhận code + token</p>
+    <p>Nhập 1 lần — lưu vĩnh viễn</p>
   </div>
   <div class="steps" id="steps4"></div>
   <div class="panel">
@@ -1666,13 +2026,17 @@ body>*{position:relative;z-index:1}
 
 <!-- STEP 5: DASHBOARD -->
 <div id="view-result" class="view">
+  <div class="session-banner" id="session-banner">
+    <span>💾 Phiên đã được lưu — lần sau không cần đăng nhập lại</span>
+    <button onclick="forgetDevice()">Đăng xuất</button>
+  </div>
+
   <div class="lc-header" style="border-color:rgba(16,185,129,0.3)">
     <div class="lc-icon" style="color:var(--success);background:rgba(16,185,129,0.1);border-color:rgba(16,185,129,0.3)"><svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></div>
     <h2>Dashboard</h2>
     <p>Tài khoản, Token & Redeem Engine</p>
   </div>
 
-  <!-- Account info -->
   <div class="info-card">
     <div class="info-row"><span class="info-label">Tài khoản</span><span class="info-value" id="info-username">-</span></div>
     <div class="info-row"><span class="info-label">Số dư Vin</span><span class="info-value" id="info-balance" style="color:var(--success)">0</span></div>
@@ -1680,7 +2044,6 @@ body>*{position:relative;z-index:1}
     <div class="info-row"><span class="info-label">Đăng nhập lúc</span><span class="info-value" id="info-login-time" style="font-size:12px;color:var(--muted)">-</span></div>
   </div>
 
-  <!-- Token status -->
   <div class="section-title">Token Status</div>
   <div class="token-grid">
     <div class="token-card" id="token-card-at">
@@ -1696,7 +2059,6 @@ body>*{position:relative;z-index:1}
     </div>
   </div>
 
-  <!-- ⚡ AUTO REDEEM -->
   <div class="section-title">⚡ Auto Get & Redeem</div>
   <div class="auto-section">
     <div class="auto-toggle-row">
@@ -1707,19 +2069,22 @@ body>*{position:relative;z-index:1}
       <button class="auto-btn" id="btn-auto-toggle" data-state="off" onclick="toggleAuto()">BẬT</button>
     </div>
     <div style="font-size:11px;color:var(--muted);line-height:1.6">
-      📡 Lắng nghe kênh LC79 realtime → fire redeem ngay khi có tin mới. JWT tự động refresh nền. Cần GET JWT trước khi bật.
+      📡 Lắng nghe kênh LC79 realtime → fire redeem ngay khi có tin mới. Auto-watch <strong style="color:var(--success)">treo vĩnh viễn</strong> — tắt tab / reload / restart server vẫn tiếp tục chạy.
     </div>
   </div>
 
-  <!-- 🎯 MANUAL REDEEM -->
+  <div class="section-title">🔔 Nhắc Tool Kiểm Tra</div>
+  <div class="force-panel">
+    <p>Nhận được thông báo có code mới nhưng web chưa kịp xử lý? Bấm nút này để <strong>quét lại 20 tin gần nhất</strong> và fire ngay các code chưa được redeem.</p>
+    <button class="btn btn-warning" id="btn-force-scan" onclick="forceScan()" style="font-size:14px">🔔 NHẮC TOOL CHECK CODE</button>
+  </div>
+
   <div class="section-title">🎯 Nhập Code Thủ Công</div>
   <div class="manual-panel">
     <input type="text" id="manualCode" placeholder="VD: DVANXYZGE hoặc LC79DVANXYZGE" autocomplete="off" style="text-transform:uppercase">
-    <input type="text" id="manualCaptcha" placeholder="Captcha (để trống nếu không có)" autocomplete="off">
     <button class="btn btn-success" id="btn-manual-redeem" onclick="redeemManual()">⚡ NHẬP NGAY</button>
   </div>
 
-  <!-- Auto redeem log -->
   <div class="section-title">Auto Redeem Log</div>
   <div class="panel" id="auto-events-panel" style="padding:10px">
     <div class="auto-log" id="auto-events">
@@ -1727,7 +2092,6 @@ body>*{position:relative;z-index:1}
     </div>
   </div>
 
-  <!-- Stats -->
   <div class="section-title">API Statistics</div>
   <div class="stats-grid">
     <div class="stat-box"><div class="stat-lbl">Total Requests</div><div class="stat-val" id="stat-total">0</div></div>
@@ -1736,7 +2100,6 @@ body>*{position:relative;z-index:1}
     <div class="stat-box"><div class="stat-lbl">Avg Time</div><div class="stat-val" id="stat-avg">0 ms</div></div>
   </div>
 
-  <!-- Giftcodes list -->
   <div class="section-title">Giftcode LC79</div>
   <div class="code-actions">
     <button onclick="fetchCodes()" class="primary">🔄 REFRESH CODE</button>
@@ -1746,7 +2109,6 @@ body>*{position:relative;z-index:1}
     <div style="text-align:center;color:var(--muted);padding:20px">Đang quét kênh...</div>
   </div>
 
-  <!-- API Console -->
   <div class="section-title">API Console</div>
   <div class="code-actions">
     <button onclick="checkApi()">🔍 CHECK API</button>
@@ -1758,16 +2120,17 @@ body>*{position:relative;z-index:1}
       <div style="color:var(--muted);text-align:center;padding:12px">Nhấn VIEW LOG để tải log</div>
     </div>
   </div>
-
-  <button class="btn btn-ghost" style="margin-top:20px" onclick="restart()">🔄 Làm Lại Từ Đầu</button>
 </div>
 
 <script>
+const PERSIST_KEY = 'lc79_persist_token';
+
 let state = {
-  session_id: '', gameUser: '', gameBalance: 0, gameXu: 0,
+  session_id: '', persistToken: '',
+  gameUser: '', gameBalance: 0, gameXu: 0,
   loginTime: 0, codes: [], logVisible: false,
   atReady: false, jwtReady: false, jwtExp: 0,
-  autoEnabled: false,
+  autoEnabled: false, booting: true,
 };
 
 function showView(id) {
@@ -1801,6 +2164,14 @@ function hideAlert(id) {
 function startFlow() { state.session_id = ''; showView('view-api'); updateSteps('steps1', 1); }
 function restart() { state.session_id = ''; showView('view-home'); }
 
+function savePersist(token) {
+  if (token) {
+    localStorage.setItem(PERSIST_KEY, token);
+    state.persistToken = token;
+    document.getElementById('session-banner').classList.add('show');
+  }
+}
+
 async function sendOTP() {
   const api_id = document.getElementById('apiId').value.trim();
   const api_hash = document.getElementById('apiHash').value.trim();
@@ -1831,8 +2202,10 @@ async function verifyOTP() {
   try {
     const res = await fetch('/api/verify_code', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session_id: state.session_id, code})});
     const data = await res.json();
-    if (data.status === 'ok') { showView('view-game'); updateSteps('steps4', 4); }
-    else if (data.status === '2fa') {
+    if (data.status === 'ok') {
+      if (data.persist_token) savePersist(data.persist_token);
+      showView('view-game'); updateSteps('steps4', 4);
+    } else if (data.status === '2fa') {
       showView('view-2fa'); updateSteps('steps3', 3);
       document.getElementById('password2fa').value = '';
       document.getElementById('password2fa').focus();
@@ -1850,8 +2223,10 @@ async function verify2FA() {
   try {
     const res = await fetch('/api/verify_2fa', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session_id: state.session_id, password})});
     const data = await res.json();
-    if (data.status === 'ok') { showView('view-game'); updateSteps('steps4', 4); }
-    else { showAlert('alert-2fa', data.message); }
+    if (data.status === 'ok') {
+      if (data.persist_token) savePersist(data.persist_token);
+      showView('view-game'); updateSteps('steps4', 4);
+    } else { showAlert('alert-2fa', data.message); }
   } catch (e) { showAlert('alert-2fa', 'Lỗi kết nối server!'); }
   finally { btn.innerText = 'Xác Nhận'; btn.disabled = false; }
 }
@@ -1864,7 +2239,7 @@ async function gameLogin() {
   const btn = document.getElementById('btn-game-login');
   btn.innerText = 'Đang đăng nhập...'; btn.disabled = true;
   try {
-    const res = await fetch('/api/login_game', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username, password, session_id: state.session_id})});
+    const res = await fetch('/api/login_game', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username, password, session_id: state.session_id, persist_token: state.persistToken})});
     const data = await res.json();
     if (data.status === 'ok') {
       state.gameUser = data.username; state.gameBalance = data.balance; state.gameXu = data.xuTotal;
@@ -1894,12 +2269,10 @@ function updateTokenStatusFromState() {
   const atCard = document.getElementById('token-card-at');
   const atStatus = document.getElementById('at-status');
   if (state.atReady) {
-    atCard.classList.add('ok');
-    atStatus.className = 'token-status ok';
+    atCard.classList.add('ok'); atStatus.className = 'token-status ok';
     atStatus.textContent = '✅ Đã có token';
   } else {
-    atCard.classList.remove('ok');
-    atStatus.className = 'token-status pending';
+    atCard.classList.remove('ok'); atStatus.className = 'token-status pending';
     atStatus.textContent = '⚠ Chưa lấy — bấm GET TOKEN';
   }
   const jwtCard = document.getElementById('token-card-jwt');
@@ -1913,8 +2286,7 @@ function updateTokenStatusFromState() {
       return;
     }
   }
-  jwtCard.classList.remove('ok');
-  jwtStatus.className = 'token-status pending';
+  jwtCard.classList.remove('ok'); jwtStatus.className = 'token-status pending';
   jwtStatus.textContent = state.jwtReady ? '⚠ Hết hạn — bấm REFRESH' : '⚠ Chưa có — bấm GET JWT';
 }
 
@@ -1964,19 +2336,14 @@ async function refreshStats() {
   } catch (e) {}
 }
 
-/* ============ MANUAL REDEEM ============ */
 async function redeemManual() {
   const code = document.getElementById('manualCode').value.trim();
-  const captcha = document.getElementById('manualCaptcha').value.trim();
   if (!code) { toast('Nhập code trước'); return; }
   const btn = document.getElementById('btn-manual-redeem');
   btn.disabled = true; btn.textContent = '⚡ Đang bắn...';
   const t0 = performance.now();
   try {
-    const res = await fetch('/api/redeem_manual', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({session_id: state.session_id, code, captcha})
-    });
+    const res = await fetch('/api/redeem_manual', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session_id: state.session_id, code})});
     const data = await res.json();
     const ms = Math.round(performance.now() - t0);
     if (data.http === 200 || data.http === 201) {
@@ -1989,35 +2356,39 @@ async function redeemManual() {
     }
     await refreshAutoEvents();
     await refreshStats();
-  } catch (e) {
-    toast('Lỗi kết nối server');
-  } finally {
-    btn.disabled = false; btn.textContent = '⚡ NHẬP NGAY';
-  }
+  } catch (e) { toast('Lỗi kết nối server'); }
+  finally { btn.disabled = false; btn.textContent = '⚡ NHẬP NGAY'; }
 }
 
-/* ============ AUTO WATCH ============ */
+async function forceScan() {
+  const btn = document.getElementById('btn-force-scan');
+  btn.disabled = true; btn.textContent = '🔍 Đang quét...';
+  try {
+    const res = await fetch('/api/force_scan', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session_id: state.session_id})});
+    const data = await res.json();
+    if (data.status === 'ok') {
+      toast(data.fired > 0 ? `🔔 Đã fire ${data.fired} code mới` : '✅ Không có code mới để fire');
+    } else {
+      toast('Lỗi: ' + (data.message || 'unknown'));
+    }
+    await refreshAutoEvents();
+  } catch (e) { toast('Lỗi kết nối server'); }
+  finally { btn.disabled = false; btn.textContent = '🔔 NHẮC TOOL CHECK CODE'; }
+}
+
 async function toggleAuto() {
   const btn = document.getElementById('btn-auto-toggle');
   const isOn = btn.dataset.state === 'on';
   btn.disabled = true; btn.textContent = '...';
   try {
-    const res = await fetch('/api/toggle_auto', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({session_id: state.session_id, enabled: !isOn})
-    });
+    const res = await fetch('/api/toggle_auto', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session_id: state.session_id, enabled: !isOn})});
     const data = await res.json();
     if (data.status === 'ok') {
       setAutoState(!isOn);
       toast(!isOn ? '🎯 Đã bật Auto Watch — sẽ fire code khi có tin mới' : '🛑 Đã tắt Auto Watch');
-    } else {
-      toast('Lỗi: ' + (data.message || 'unknown'));
-    }
-  } catch (e) {
-    toast('Lỗi kết nối server');
-  } finally {
-    btn.disabled = false;
-  }
+    } else { toast('Lỗi: ' + (data.message || 'unknown')); }
+  } catch (e) { toast('Lỗi kết nối server'); }
+  finally { btn.disabled = false; }
 }
 
 function setAutoState(on) {
@@ -2025,16 +2396,13 @@ function setAutoState(on) {
   state.autoEnabled = on;
   btn.dataset.state = on ? 'on' : 'off';
   btn.textContent = on ? 'TẮT' : 'BẬT';
-  document.getElementById('auto-status').textContent = on ? '🟢 Đang theo dõi realtime' : '⚪ Chưa bật';
+  document.getElementById('auto-status').textContent = on ? '🟢 Đang theo dõi realtime (treo vĩnh viễn)' : '⚪ Chưa bật';
 }
 
 async function refreshAutoEvents() {
   if (!state.session_id) return;
   try {
-    const res = await fetch('/api/auto_status', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({session_id: state.session_id})
-    });
+    const res = await fetch('/api/auto_status', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session_id: state.session_id})});
     const data = await res.json();
     if (data.status !== 'ok') return;
     if (data.enabled !== state.autoEnabled) setAutoState(!!data.enabled);
@@ -2057,26 +2425,16 @@ async function refreshAutoEvents() {
       const cls = isSuccess ? 'success' : isSkipped ? 'skipped' : 'fail';
       const icon = isSuccess ? '✅' : isSkipped ? '⏸' : '❌';
       const amtStr = e.amount ? ` <strong style="color:var(--success)">+${Number(e.amount).toLocaleString('vi-VN')}</strong>` : '';
-      const candStr = e.candidates && e.candidates.length > 1
-        ? ` <span style="color:var(--warning)">[${e.candidates.length} fmt]</span>` : '';
+      const candStr = e.candidates && e.candidates.length > 1 ? ` <span style="color:var(--warning)">[${e.candidates.length} fmt]</span>` : '';
       const timing = [];
       if (e.delay_ms !== undefined) timing.push(`fire +${e.delay_ms}ms`);
       if (e.elapsed_ms !== undefined) timing.push(`HTTP ${e.elapsed_ms}ms`);
       if (e.total_ms !== undefined) timing.push(`total ${e.total_ms}ms`);
       const div = document.createElement('div');
       div.className = 'event ' + cls;
-      div.innerHTML = `
-        <div><span class="ev-code">${e.code}</span>${amtStr}${candStr}</div>
-        <div class="ev-meta">
-          ${icon} ${time} · HTTP ${e.http || '-'} ${e.manual ? '· MANUAL' : '· AUTO'}
-          ${timing.length ? ' · ' + timing.join(' · ') : ''}
-          ${e.message ? '<br>' + e.message : ''}
-        </div>
-      `;
-      container.appendChild(container.firstChild ? div : div);
+      div.innerHTML = `<div><span class="ev-code">${e.code}</span>${amtStr}${candStr}</div><div class="ev-meta">${icon} ${time} · HTTP ${e.http || '-'} ${e.manual ? '· MANUAL' : '· AUTO'}${timing.length ? ' · ' + timing.join(' · ') : ''}${e.message ? '<br>' + e.message : ''}</div>`;
+      container.appendChild(div);
     });
-    const ordered = Array.from(container.querySelectorAll('.event'));
-    // Already appended in reversed order; keep as-is
   } catch (e) {}
 }
 
@@ -2092,21 +2450,10 @@ async function fetchCodes() {
       data.items.forEach((item, i) => {
         const div = document.createElement('div');
         div.className = 'code-box';
-        const badge = item.status === 'new'
-          ? '<span class="code-badge new">NEW</span>'
-          : '<span class="code-badge seen">SEEN</span>';
+        const badge = item.status === 'new' ? '<span class="code-badge new">NEW</span>' : '<span class="code-badge seen">SEEN</span>';
         let timeStr = '';
-        if (item.msg_date) {
-          const d = new Date(item.msg_date * 1000);
-          timeStr = d.toLocaleString('vi-VN', {hour:'2-digit', minute:'2-digit', day:'2-digit', month:'2-digit'});
-        }
-        div.innerHTML = `
-          <div class="code-content">
-            <div class="code-main">${i+1}. ${item.code}${badge}</div>
-            <div class="code-meta">Phát hiện: ${timeStr}</div>
-          </div>
-          <button class="copy-btn" onclick="copyCode('${item.code}')">COPY</button>
-        `;
+        if (item.msg_date) timeStr = new Date(item.msg_date * 1000).toLocaleString('vi-VN', {hour:'2-digit', minute:'2-digit', day:'2-digit', month:'2-digit'});
+        div.innerHTML = `<div class="code-content"><div class="code-main">${i+1}. ${item.code}${badge}</div><div class="code-meta">Phát hiện: ${timeStr}</div></div><button class="copy-btn" onclick="copyCode('${item.code}')">COPY</button>`;
         container.appendChild(div);
       });
     } else if (data.status === 'ok') {
@@ -2116,9 +2463,7 @@ async function fetchCodes() {
       container.innerHTML = `<div style="color:var(--danger);text-align:center;padding:20px">${data.message || 'Lỗi'}</div>`;
       state.codes = [];
     }
-  } catch (e) {
-    container.innerHTML = '<div style="color:var(--danger);text-align:center;padding:20px">Lỗi kết nối!</div>';
-  }
+  } catch (e) { container.innerHTML = '<div style="color:var(--danger);text-align:center;padding:20px">Lỗi kết nối!</div>'; }
   await refreshStats();
 }
 
@@ -2168,11 +2513,7 @@ function renderLogEntry(e) {
   if (e.body) extra += ' ' + JSON.stringify(e.body).slice(0, 200);
   if (e.error) extra += ' ' + e.error;
   const safe = (s) => String(s).replace(/</g,'&lt;');
-  return `<div class="log-entry log-${e.level}">
-    <span class="log-time">[${e.time}]</span>
-    <span class="log-tag">[${e.level.toUpperCase()}]</span>
-    <span>${safe(e.message)}${safe(extra)}</span>
-  </div>`;
+  return `<div class="log-entry log-${e.level}"><span class="log-time">[${e.time}]</span><span class="log-tag">[${e.level.toUpperCase()}]</span><span>${safe(e.message)}${safe(extra)}</span></div>`;
 }
 
 async function loadLogs() {
@@ -2198,16 +2539,73 @@ async function clearLog() {
   } catch (e) { toast('Lỗi xoá log'); }
 }
 
+async function forgetDevice() {
+  if (!confirm('Đăng xuất thiết bị này?\nLần sau sẽ cần đăng nhập Telegram + Game lại.')) return;
+  try {
+    await fetch('/api/forget', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({persist_token: state.persistToken, session_id: state.session_id})});
+  } catch (e) {}
+  localStorage.removeItem(PERSIST_KEY);
+  state.persistToken = '';
+  document.getElementById('session-banner').classList.remove('show');
+  restart();
+  toast('Đã đăng xuất');
+}
+
+async function tryResume() {
+  const token = localStorage.getItem(PERSIST_KEY);
+  if (!token) { state.booting = false; return false; }
+  try {
+    const res = await fetch('/api/resume', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({persist_token: token})});
+    const data = await res.json();
+    if (data.status === 'ok') {
+      state.session_id = data.session_id;
+      state.persistToken = token;
+      state.gameUser = data.game_username || data.nickname || '';
+      state.gameBalance = data.vin || 0;
+      state.gameXu = data.xu || 0;
+      state.loginTime = data.login_time || 0;
+      state.atReady = !!data.access_token_ready;
+      state.jwtReady = !!data.jwt_ready;
+      state.jwtExp = data.jwt_exp || 0;
+      showView('view-result');
+      document.getElementById('session-banner').classList.add('show');
+      renderAccountInfo();
+      updateTokenStatusFromState();
+      setAutoState(!!data.auto_enabled);
+      state.booting = false;
+      await fetchCodes();
+      await refreshStats();
+      await refreshAutoEvents();
+      toast('💾 Đã khôi phục phiên — không cần đăng nhập lại');
+      return true;
+    } else {
+      localStorage.removeItem(PERSIST_KEY);
+      state.booting = false;
+      return false;
+    }
+  } catch (e) {
+    state.booting = false;
+    return false;
+  }
+}
+
 document.getElementById('otpCode')?.addEventListener('keypress', e => { if (e.key === 'Enter') verifyOTP(); });
 document.getElementById('password2fa')?.addEventListener('keypress', e => { if (e.key === 'Enter') verify2FA(); });
 document.getElementById('manualCode')?.addEventListener('keypress', e => { if (e.key === 'Enter') redeemManual(); });
 
-// Auto-poll when dashboard active
 setInterval(() => {
-  if (document.getElementById('view-result').classList.contains('active')) {
+  if (document.getElementById('view-result').classList.contains('active') && state.session_id) {
     refreshAutoEvents();
   }
-}, 2000);
+}, 2500);
+
+// Auto-resume on page load
+(async () => {
+  const resumed = await tryResume();
+  if (!resumed && state.booting) {
+    // stay on home
+  }
+})();
 </script>
 </body>
 </html>
@@ -2323,10 +2721,13 @@ def run_flask():
 
 # ============ MAIN ============
 if __name__ == "__main__":
+    _load_persist()
     threading.Thread(target=_warm_redeem_connection, daemon=True, name="WarmRedeem").start()
     async_manager.start()
     threading.Thread(target=cleanup_old_sessions, daemon=True, name="SessionCleanup").start()
     threading.Thread(target=keep_alive, daemon=True, name="KeepAlive").start()
     threading.Thread(target=jwt_prewarm_loop, daemon=True, name="JwtPrewarm").start()
+    threading.Thread(target=session_keepalive_loop, daemon=True, name="SessionKeepalive").start()
+    threading.Thread(target=restore_persistent_sessions_loop, daemon=True, name="RestorePersist").start()
     logger.info(f"🚀 Web server khởi động tại port {PORT}")
     run_flask()
