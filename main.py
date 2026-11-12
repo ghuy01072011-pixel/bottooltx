@@ -178,8 +178,11 @@ def api_get_codes():
             logger.info("Bắt đầu quét tin nhắn tìm code...")
 
             async for msg in client.iter_messages(channel_entity, limit=100):
-                # Lấy text từ cả tin nhắn chữ và caption của ảnh
-                raw_text = msg.message or msg.text or msg.caption or ""
+                # FIX LỖI TẠI ĐÂY: Dùng getattr để tránh lỗi MessageService object has no attribute 'caption'
+                # Telethon dùng .message để lấy text hoặc caption của media an toàn nhất
+                raw_text = getattr(msg, 'message', '')
+                if not raw_text:
+                    raw_text = getattr(msg, 'text', '')
                 
                 if not raw_text:
                     continue
