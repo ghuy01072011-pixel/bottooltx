@@ -5,7 +5,6 @@ import logging
 import requests
 import re
 import asyncio
-import hashlib
 import base64
 import json
 from flask import Flask, Response, request, jsonify
@@ -32,17 +31,18 @@ logger = logging.getLogger("AutoTool")
 
 flask_app = Flask(__name__)
 
-# ============ LC79 CONSTANTS ============
+# ============ LC79 CONSTANTS (Đồng bộ từ script của bạn) ============
 API_GET_ACCESS = "https://apifo88daigia.tele68.com/api"
 LOGIN_URL = "https://wlb.tele68.com/v1/lobby/auth/login"
 BASE_URL = "https://gameapi.tele68.com"
 PARAMS = "/v1/giftcode/redemption?cp=R&cl=R&pf=web&at="
 CONNECT_TIMEOUT = 5
 READ_TIMEOUT = 45
+MAX_RETRY = 3
 
 # ============ GLOBAL STATE ============
 STATE = {
-    "codes": [],
+    "codes": [], # [{"code": "XXXX", "status": "Pending", "msg": ""}]
     "lc79_account": None,
     "listener_running": False,
     "user_chat_id": None
@@ -57,12 +57,12 @@ def notify_user(text):
         logger.error(f"Lỗi gửi thông báo: {e}")
 
 # ================================================================
-#                    LC79 REDEMPTION LOGIC
+#                    LC79 REDEMPTION LOGIC (Y HỆT SCRIPT)
 # ================================================================
 class Account:
-    def __init__(self, un, pw, nick):
+    def __init__(self, un, pw_md5, nick):
         self.un = un
-        self.pw = pw 
+        self.pw = pw_md5 # Nhận trực tiếp pass đã mã hóa MD5
         self.nick = nick
         self.used_codes = set()
         self.lock = threading.Lock()
@@ -72,12 +72,14 @@ class Account:
     def _headers(self, auth=None):
         h = {
             "content-type": "application/json",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "user-agent": "Mozilla/5.0",
             "origin": "https://lc79.to",
             "referer": "https://lc79.to/",
             "accept": "application/json, text/plain, */*",
+            "connection": "close",
         }
-        if auth: h["authorization"] = f"Bearer {auth}"
+        if auth:
+            h["authorization"] = f"Bearer {auth}"
         return h
 
     @staticmethod
@@ -101,21 +103,18 @@ class Account:
                     "cp": "R", "cl": "R", "pf": "web", "at": ""
                 }, headers=self._headers(), timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             data = res.json()
-            logger.info(f"[BƯỚC 1] Response: {data}")
-            
+            logger.info(f"[{self.nick}] BƯỚC 1 - AccessToken Response: {data}")
             if data.get("success"):
-                return data.get("accessToken") or data.get("sessionKey")
-            else:
-                logger.warning(f"[BƯỚC 1] Lỗi API: {data}")
-                return None
+                return data.get("accessToken")
+            return None
         except Exception as e:
-            logger.error(f"[BƯỚC 1] Lỗi kết nối: {e}")
+            logger.error(f"[{self.nick}] Lỗi get_access_token: {e}")
             return None
 
     def refresh_token(self):
         access_token = self.get_access_token()
         if not access_token:
-            return False, "Sai tài khoản hoặc mật khẩu (Bước 1 thất bại)."
+            return False, "Sai tài khoản hoặc mật khẩu MD5."
 
         try:
             login_headers = self._headers()
@@ -124,25 +123,24 @@ class Account:
             
             with requests.Session() as s:
                 res = s.post(LOGIN_URL, headers=login_headers, json={
-                    "nickName": self.nick, 
-                    "accessToken": access_token
+                    "nickName": self.nick, "accessToken": access_token
                 }, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             data = res.json()
-            logger.info(f"[BƯỚC 2] Response: {data}")
+            logger.info(f"[{self.nick}] BƯỚC 2 - Login Response: {data}")
             
-            new_token = data.get("accessToken") or data.get("sessionKey") or data.get("token")
+            # Ưu tiên lấy token như script gốc, fallback sang các key khác nếu cần
+            new_token = data.get("token") or data.get("accessToken") or data.get("sessionKey")
+            
             if new_token:
                 self.jwt = new_token
                 self.jwt_exp = self.parse_jwt_exp(new_token)
                 if self.jwt_exp == 0:
-                    self.jwt_exp = time.time() + 3600
-                return True, "OK"
-            else:
-                msg = data.get("message") or data.get("msg") or "Lỗi không xác định từ server LC79."
-                return False, msg
+                    self.jwt_exp = time.time() + 3600 # Fallback 1 giờ
+                return True, "Thành công"
+            return False, data.get("message", "Lỗi không xác định từ server LC79.")
         except Exception as e:
-            logger.error(f"[BƯỚC 2] Lỗi kết nối: {e}")
-            return False, "Lỗi kết nối đến server LC79."
+            logger.error(f"[{self.nick}] Lỗi refresh_token: {e}")
+            return False, "Lỗi kết nối server."
 
     def redeem_code(self, code, _retry=False, _attempt=0):
         with self.lock:
@@ -157,23 +155,28 @@ class Account:
 
         try:
             with requests.Session() as s:
-                res = s.post(BASE_URL + PARAMS, headers=self._headers(self.jwt),
-                             json={"code": code.strip(), "captcha": ""}, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+                res = s.post(
+                    BASE_URL + PARAMS,
+                    headers=self._headers(self.jwt),
+                    json={"code": code.strip(), "captcha": ""},
+                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)
+                )
+
             try: data = res.json()
             except: data = {}
 
             if res.status_code == 401:
-                success, _ = self.refresh_token()
-                if success:
-                    with self.lock: self.used_codes.discard(code)
+                if self.refresh_token()[0]:
+                    with self.lock:
+                        self.used_codes.discard(code)
                     return self.redeem_code(code, _retry=True)
-                return False, "Lỗi xác thực"
+                return False, "Lỗi xác thực Token."
 
             if res.status_code in [200, 201]:
                 amount = data.get("money") or data.get("amount") or data.get("reward") or (data.get("data") or {}).get("money")
                 return True, f"+{int(amount):,}k" if amount else "Thành công"
             elif res.status_code == 400:
-                msg = data.get("message") if isinstance(data, dict) else "Thất bại"
+                msg = data.get("message") if isinstance(data, dict) else res.text
                 return False, msg
             elif res.status_code == 428:
                 return False, "Yêu cầu CAPTCHA"
@@ -181,8 +184,13 @@ class Account:
                 return False, "Quá giới hạn"
             else:
                 return False, f"Lỗi {res.status_code}"
-        except Exception:
-            if _attempt < 2:
+
+        except requests.exceptions.Timeout:
+            if _attempt < MAX_RETRY:
+                return self.redeem_code(code, _retry=_retry, _attempt=_attempt+1)
+            return False, "Quá thời gian kết nối"
+        except Exception as e:
+            if _attempt < MAX_RETRY:
                 return self.redeem_code(code, _retry=_retry, _attempt=_attempt+1)
             return False, "Lỗi mạng"
 
@@ -208,10 +216,12 @@ def redeem_thread(item, acc):
     if success:
         item["status"] = "Success"
         item["msg"] = msg
+        logger.info(f"✅ REDEEM THÀNH CÔNG: {item['code']} - {msg}")
         notify_user(f"✅ <b>NHẬP CODE THÀNH CÔNG</b>\n\n🎁 Mã: <code>{item['code']}</code>\n💰 Nhận được: <b>{msg}</b>")
     else:
         item["status"] = "Failed"
         item["msg"] = msg
+        logger.warning(f"❌ REDEEM THẤT BẠI: {item['code']} - {msg}")
         notify_user(f"❌ <b>NHẬP CODE THẤT BẠI</b>\n\n🎁 Mã: <code>{item['code']}</code>\n⚠️ Lý do: {msg}")
 
 # ================================================================
@@ -236,9 +246,14 @@ def start_background_listener(session_str, api_id, api_hash):
             @client.on(events.NewMessage(chats='codelaucuagame'))
             async def handler(event):
                 text = event.raw_text or ""
+                # Regex tìm mã bắt đầu bằng LC79 và theo sau là chữ/số
                 match = re.search(r"LC79([A-Z0-9]+)", text)
-                if match: process_new_code(match.group(1))
+                if match:
+                    # Cắt bỏ 4 chữ LC79, chỉ lấy phần sau (như yêu cầu trước đó)
+                    code = match.group(1)
+                    process_new_code(code)
 
+            logger.info("🚀 Background Listener đang chạy (Real-time)...")
             await client.run_until_disconnected()
 
         loop.run_until_complete(main())
@@ -309,18 +324,19 @@ def api_verify_2fa():
 @flask_app.route("/api/login_lc79", methods=["POST"])
 def api_login_lc79():
     data = request.json
-    un, pw = data.get("username"), data.get("password")
+    un, pw_md5 = data.get("username"), data.get("password")
     user_id = data.get("user_id")
     
     if user_id: STATE["user_chat_id"] = user_id
-    if not un or not pw: return jsonify({"status": "error", "message": "Thiếu thông tin."})
+    if not un or not pw_md5: return jsonify({"status": "error", "message": "Thiếu thông tin."})
     
-    md5_pw = hashlib.md5(pw.encode()).hexdigest()
-    acc = Account(un, md5_pw, un)
+    # Không băm MD5 nữa, nhận trực tiếp từ Client
+    acc = Account(un, pw_md5, un)
     
     success, msg = acc.refresh_token()
     if success:
         STATE["lc79_account"] = acc
+        # Tự động nhập các mã đang chờ (nếu có)
         for item in STATE["codes"]:
             if item["status"] == "Pending":
                 threading.Thread(target=redeem_thread, args=(item, acc)).start()
@@ -402,7 +418,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
     <div class="header"><h1>Đăng Nhập LC79</h1><p>Tool sẽ tự động nhập code khi có mã mới</p></div>
     <div class="card">
       <div class="input-group"><label>Tài khoản LC79</label><input type="text" id="lc79User" placeholder="Nhập tên đăng nhập"></div>
-      <div class="input-group"><label>Mật khẩu LC79</label><input type="password" id="lc79Pass" placeholder="Nhập mật khẩu (chưa mã hoá)"></div>
+      <div class="input-group"><label>Mật khẩu (Đã mã hóa MD5)</label><input type="text" id="lc79Pass" placeholder="Nhập chuỗi MD5 (VD: d6bddc...)"></div>
       <button class="btn" id="btn-login-lc79" onclick="loginLC79()">Kết Nối & Chạy Auto</button>
     </div>
   </div>
@@ -479,7 +495,7 @@ function saveSessionAndStart(session) {
 
 async function loginLC79() {
   const username = document.getElementById('lc79User').value.trim();
-  const password = document.getElementById('lc79Pass').value.trim();
+  const password = document.getElementById('lc79Pass').value.trim(); // Pass này đã là MD5
   if (!username || !password) return alert("Nhập đủ tài khoản/mật khẩu!");
   const btn = document.getElementById('btn-login-lc79');
   btn.innerText = "Đang kết nối..."; btn.disabled = true;
@@ -560,7 +576,7 @@ START_MESSAGE = """
 ━━━━━━━━━━━━━━━━━━━━
 <tg-emoji emoji-id="5276398495459370121">⚡</tg-emoji> Quét tin nhắn Real-time (0.1s).
 <tg-emoji emoji-id="5386714776240519929">🤖</tg-emoji> Auto nhập code vào LC79.
-<tg-emoji emoji-id="5278578979322940035">🛡️</tg-emoji> Bảo mật MD5 — Không lưu mật khẩu.
+<tg-emoji emoji-id="5278578979322940035">🛡️</tg-emoji> Đồng bộ logic 100% với Tool.
 
 ━━━━━━━━━━━━━━━━━━━━
 🎯 <b>Bấm nút bên dưới để trải nghiệm ngay</b> 👇
