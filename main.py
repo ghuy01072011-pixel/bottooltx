@@ -130,43 +130,66 @@ def api_get_codes():
             client = TelegramClient(StringSession(session_str), int(api_id), api_hash)
             await client.connect()
 
-            # Thử nhiều định dạng khác nhau để tìm kênh
-            channel_targets = [
-                'https://t.me/codelaucuagame',
-                -1002237214360,
-                'codelaucuagame'
-            ]
-
             channel_entity = None
-            for target in channel_targets:
+
+            # 1. Quét qua danh sách Dialogs (Cuộc trò chuyện) để tìm kênh
+            try:
+                async for dialog in client.iter_dialogs(limit=200):
+                    if dialog.id == -1002237214360 or (dialog.entity and getattr(dialog.entity, 'username', '') == 'codelaucuagame'):
+                        channel_entity = dialog.entity
+                        break
+            except Exception as e:
+                logger.warning(f"Lỗi quét dialogs: {e}")
+
+            # 2. Nếu chưa có, thử get_entity bằng username
+            if not channel_entity:
                 try:
-                    channel_entity = await client.get_entity(target)
-                    break
+                    channel_entity = await client.get_entity('codelaucuagame')
                 except Exception:
-                    continue
+                    pass
+
+            # 3. Thử get_entity bằng link
+            if not channel_entity:
+                try:
+                    channel_entity = await client.get_entity('https://t.me/codelaucuagame')
+                except Exception:
+                    pass
+
+            # 4. Thử get_entity bằng ID
+            if not channel_entity:
+                try:
+                    channel_entity = await client.get_entity(-1002237214360)
+                except Exception:
+                    pass
 
             if not channel_entity:
-                return {"status": "error", "message": "Không thể tìm thấy kênh. Tài khoản có thể bị hạn chế."}
+                return {"status": "error", "message": "Không thể tìm thấy kênh. Tài khoản có thể chưa join hoặc kênh bị ẩn."}
 
-            # Auto join kênh
+            # Thực hiện join nếu chưa tham gia
             try:
                 await client(functions.channels.JoinChannelRequest(channel=channel_entity))
+                logger.info("Đã join kênh thành công.")
             except Exception as e:
-                logger.warning(f"Join channel note (có thể đã join): {e}")
+                logger.info(f"Join channel note (có thể đã join rồi): {e}")
 
-            # Quét 100 tin nhắn gần nhất
+            # Lấy 100 tin nhắn gần nhất
             codes = []
             pattern = re.compile(r'LC79[A-Z0-9]+')
+            logger.info("Bắt đầu quét tin nhắn tìm code...")
 
             async for msg in client.iter_messages(channel_entity, limit=100):
-                if not msg.text:
-                    continue
+                # Lấy text từ cả tin nhắn chữ và caption của ảnh
+                raw_text = msg.message or msg.text or msg.caption or ""
                 
-                matches = pattern.findall(msg.text)
+                if not raw_text:
+                    continue
+                    
+                matches = pattern.findall(raw_text)
                 for match in matches:
-                    stripped_code = match[4:].strip() # Bỏ 4 chữ "LC79"
+                    stripped_code = match[4:].strip()
                     if stripped_code and stripped_code not in codes:
                         codes.append(stripped_code)
+                        logger.info(f"Tìm thấy code: {stripped_code}")
                     
                     if len(codes) >= 10:
                         break
@@ -174,11 +197,14 @@ def api_get_codes():
                 if len(codes) >= 10:
                     break
 
+            if not codes:
+                return {"status": "error", "message": "Không tìm thấy code LC79 nào trong 100 tin nhắn gần nhất."}
+
             return {"status": "ok", "codes": codes}
             
         except Exception as e:
             logger.error(f"Lỗi get_codes: {e}")
-            return {"status": "error", "message": "Lỗi phiên đăng nhập. Vui lòng thử đăng nhập lại."}
+            return {"status": "error", "message": f"Lỗi: {str(e)}"}
         finally:
             if client and client.is_connected():
                 await client.disconnect()
