@@ -23,7 +23,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # CONFIG — set these as environment variables on your host.
 # Never put real tokens/passwords in source code.
 # ============================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8584201446:AAHAINg4IALEX1sJ-dmiinLsPLZ-u_S0nTc")
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or 0)
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 TELEGRAM_SESSION = os.getenv("TELEGRAM_SESSION", "")  # Create locally; do not collect it in the Mini App.
