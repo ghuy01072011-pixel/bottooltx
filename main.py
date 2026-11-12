@@ -8,7 +8,6 @@ import asyncio
 import hashlib
 import base64
 import json
-from collections import deque
 from flask import Flask, Response, request, jsonify
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, BotCommand
@@ -25,14 +24,18 @@ PORT          = int(os.getenv("PORT", 10000))
 PING_INTERVAL = int(os.getenv("PING_INTERVAL", 10))
 WEBAPP_URL    = os.getenv("WEBAPP_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
 
-# LC79 Endpoints
-LC79_API_GET_ACCESS = "https://apifo88daigia.tele68.com/api"
-LC79_LOGIN_URL      = "https://wlb.tele68.com/v1/lobby/auth/login"
-LC79_BASE_URL       = "https://gameapi.tele68.com"
-LC79_PARAMS         = "/v1/giftcode/redemption?cp=R&cl=R&pf=web&at="
+# ========== LC79 ENDPOINTS (GIỮ NGUYÊN GỐC) ==========
+API_GET_ACCESS = "https://apifo88daigia.tele68.com/api"
+LOGIN_URL      = "https://wlb.tele68.com/v1/lobby/auth/login"
+BASE_URL       = "https://gameapi.tele68.com"
+PARAMS         = "/v1/giftcode/redemption?cp=R&cl=R&pf=web&at="
 
 TARGET_CHANNEL_USERNAME = "codelaucuagame"
 TARGET_CHANNEL_ID       = -1002237214360
+
+CONNECT_TIMEOUT = 5
+READ_TIMEOUT    = 45
+MAX_RETRY       = 3
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 logger = logging.getLogger("AutoTool")
@@ -40,8 +43,19 @@ logger = logging.getLogger("AutoTool")
 flask_app = Flask(__name__)
 
 # ================================================================
-#                    LC79 ACCOUNT (MD5 PASSWORD)
+#                LC79 ACCOUNT — NHẬN MD5 TRỰC TIẾP
 # ================================================================
+def normalize_pw(pw_input: str) -> str:
+    """
+    - Nếu input là 32 ký tự hex → coi là MD5 có sẵn (dùng luôn)
+    - Ngược lại → MD5 hash của password thô
+    """
+    pw = pw_input.strip()
+    if len(pw) == 32 and all(c in "0123456789abcdefABCDEF" for c in pw):
+        return pw.lower()
+    return hashlib.md5(pw.encode("utf-8")).hexdigest()
+
+
 class LC79Account:
     def __init__(self):
         self.un = None
@@ -51,16 +65,17 @@ class LC79Account:
         self.jwt_exp = 0
         self.lock = threading.Lock()
         self.redeemed = set()
+        self.last_error = None
 
-    def configure(self, username, raw_password, nickname=None):
-        """Nhận password THÔ → tự băm MD5"""
+    def configure(self, username: str, pw_input: str, nickname: str = None):
+        """pw_input: MD5 có sẵn HOẶC password thô (tự detect)"""
         self.un = username.strip()
-        self.pw_md5 = hashlib.md5(raw_password.strip().encode("utf-8")).hexdigest()
+        self.pw_md5 = normalize_pw(pw_input)
         self.nick = (nickname or username).strip()
-        logger.info(f"[LC79] Đã cấu hình acc {self.nick}")
+        logger.info(f"[LC79] Config OK | un={self.un} | nick={self.nick} | md5={self.pw_md5[:8]}...")
 
     @staticmethod
-    def parse_jwt_exp(token):
+    def parse_jwt_exp(token: str) -> int:
         try:
             payload = token.split(".")[1]
             payload += "=" * (-len(payload) % 4)
@@ -87,10 +102,10 @@ class LC79Account:
     def get_access_token(self):
         try:
             with requests.Session() as s:
-                res = s.get(LC79_API_GET_ACCESS, params={
+                res = s.get(API_GET_ACCESS, params={
                     "c": "3", "un": self.un, "pw": self.pw_md5,
                     "cp": "R", "cl": "R", "pf": "web", "at": ""
-                }, headers=self._headers(), timeout=(5, 30))
+                }, headers=self._headers(), timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             data = res.json()
             if data.get("success"):
                 return data.get("accessToken")
@@ -100,10 +115,12 @@ class LC79Account:
             logger.error(f"[LC79] get_access_token: {e}")
             return None
 
-    def refresh_token(self):
+    def refresh_token_detailed(self):
+        """Trả về (success: bool, error_msg: str or None)"""
         access = self.get_access_token()
         if not access:
-            return False
+            return False, "Sai TÀI KHOẢN hoặc MD5 MẬT KHẨU (get_access_token fail)"
+
         try:
             login_headers = {
                 "content-type": "application/json",
@@ -113,24 +130,29 @@ class LC79Account:
                 "connection": "close",
             }
             with requests.Session() as s:
-                res = s.post(LC79_LOGIN_URL, headers=login_headers,
+                res = s.post(LOGIN_URL, headers=login_headers,
                              json={"nickName": self.nick, "accessToken": access},
-                             timeout=(5, 30))
+                             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             data = res.json()
             token = data.get("token")
             if token:
                 self.jwt = token
                 self.jwt_exp = self.parse_jwt_exp(token)
                 remain = int((self.jwt_exp - time.time()) / 60) if self.jwt_exp else 0
-                logger.info(f"[LC79] ✅ Login OK, JWT còn {remain} phút")
-                return True
-            logger.warning(f"[LC79] Login fail: {data}")
-            return False
+                logger.info(f"[LC79] ✅ JWT OK (còn {remain} phút)")
+                return True, None
+            return False, f"get_access_token OK nhưng LOGIN FAIL → kiểm tra NICKNAME. Phản hồi: {data}"
         except Exception as e:
-            logger.error(f"[LC79] refresh_token: {e}")
-            return False
+            return False, f"Lỗi kết nối login: {e}"
 
-    def redeem(self, code):
+    def refresh_token(self):
+        ok, err = self.refresh_token_detailed()
+        if not ok:
+            self.last_error = err
+            logger.warning(f"[LC79] {err}")
+        return ok
+
+    def redeem(self, code: str, _attempt: int = 0):
         with self.lock:
             if code in self.redeemed:
                 return {"status": "duplicate", "message": "Đã nhập"}
@@ -141,10 +163,10 @@ class LC79Account:
 
         try:
             with requests.Session() as s:
-                res = s.post(LC79_BASE_URL + LC79_PARAMS,
+                res = s.post(BASE_URL + PARAMS,
                              headers=self._headers(self.jwt),
                              json={"code": code.strip(), "captcha": ""},
-                             timeout=(5, 30))
+                             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             try:
                 data = res.json()
             except Exception:
@@ -172,6 +194,11 @@ class LC79Account:
             if res.status_code == 429:
                 return {"status": "fail", "message": "Rate limit"}
             return {"status": "fail", "message": f"HTTP {res.status_code}"}
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if _attempt < MAX_RETRY:
+                time.sleep(1 + _attempt)
+                return self.redeem(code, _attempt=_attempt + 1)
+            return {"status": "fail", "message": str(e)[:40]}
         except Exception as e:
             return {"status": "fail", "message": str(e)[:40]}
 
@@ -186,10 +213,9 @@ class AppState:
         self.phone = None
         self.recent_codes = []
         self.listener_started = False
-        self.listener_client = None
         self.lock = threading.Lock()
         self.lc79 = LC79Account()
-        self.version = 0  # tăng mỗi khi có thay đổi
+        self.version = 0
 
 state = AppState()
 
@@ -231,7 +257,6 @@ def add_and_redeem(code):
     if not add_recent_code(code, "pending", "Đang nhập..."):
         return
     logger.info(f"🆕 Code mới: {code}")
-    # Redeem ngay lập tức (không chờ)
     threading.Thread(target=auto_redeem, args=(code,), daemon=True).start()
 
 # ================================================================
@@ -243,10 +268,9 @@ async def telethon_listener_main():
         await client.connect()
 
         if not await client.is_user_authorized():
-            logger.error("Session không hợp lệ")
+            logger.error("Session Telegram không hợp lệ")
             return
 
-        # Resolve channel
         channel = None
         for getter in (
             lambda: client.get_entity(TARGET_CHANNEL_USERNAME),
@@ -263,15 +287,12 @@ async def telethon_listener_main():
             logger.error("Không tìm thấy channel")
             return
 
-        # Auto join nếu chưa
         try:
             await client(functions.channels.JoinChannelRequest(channel=channel))
         except Exception:
             pass
 
-        state.listener_client = client
-
-        # Scan 100 tin gần nhất (chỉ load, không auto-redeem)
+        # Scan 100 tin gần nhất — load lên UI nhưng KHÔNG auto redeem
         logger.info("📡 Scan 100 tin gần nhất...")
         seen = set()
         async for msg in client.iter_messages(channel, limit=100):
@@ -282,11 +303,11 @@ async def telethon_listener_main():
                     seen.add(code)
                     add_recent_code(code, "pending", "Chưa nhập")
 
-        logger.info(f"✅ Đã load {len(seen)} code cũ | Listener ON")
+        logger.info(f"✅ Load {len(seen)} code cũ | Listener ON")
         state.listener_started = True
         _bump_version()
 
-        # ⚡ EVENT HANDLER REAL-TIME — bắt tin mới tức thì
+        # ⚡ EVENT HANDLER — bắt tin mới tức thì (< 50ms)
         @client.on(events.NewMessage(chats=channel))
         async def on_new(event):
             text = event.raw_text or ""
@@ -380,26 +401,31 @@ def api_verify_2fa():
 
 @flask_app.route("/api/lc79_login", methods=["POST"])
 def api_lc79_login():
-    """Đăng nhập LC79 + lưu Telegram session + khởi động listener"""
-    d = request.json
+    """Đăng nhập LC79 + lưu session Telegram + khởi động listener"""
+    d = request.json or {}
     username = (d.get("username") or "").strip()
-    password = (d.get("password") or "").strip()
+    pw_input = (d.get("password") or "").strip()
+    nickname = (d.get("nickname") or "").strip() or username
 
-    if not username or not password:
-        return jsonify({"status": "error", "message": "Nhập tài khoản + mật khẩu LC79."})
+    if not username or not pw_input:
+        return jsonify({"status": "error", "message": "Nhập đủ TÀI KHOẢN + MẬT KHẨU (MD5)."})
 
-    # Cấu hình LC79 (băm MD5 tự động)
-    state.lc79.configure(username, password)
+    # Cấu hình LC79 (nhận MD5 trực tiếp HOẶC password thô)
+    state.lc79.configure(username, pw_input, nickname)
 
-    if not state.lc79.refresh_token():
-        return jsonify({"status": "error",
-                        "message": "Login LC79 thất bại. Kiểm tra tài khoản/mật khẩu."})
+    # Refresh token — trả lỗi chi tiết
+    ok, err = state.lc79.refresh_token_detailed()
+    if not ok:
+        return jsonify({"status": "error", "message": err})
 
     # Lưu Telegram session
     state.session_str = d.get("session")
     state.api_id = int(d["api_id"]) if d.get("api_id") else None
     state.api_hash = d.get("api_hash")
     state.phone = d.get("phone")
+
+    if not state.session_str:
+        return jsonify({"status": "error", "message": "Thiếu session Telegram — thử đăng nhập lại Telegram."})
 
     # Khởi động listener real-time
     start_listener()
@@ -447,7 +473,7 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
 :root{
   --bg:#ffffff; --bg-alt:#f8fafc;
   --text:#0f172a; --muted:#64748b;
-  --border:#e2e8f0; --border-strong:#cbd5e1;
+  --border:#e2e8f0;
   --accent:#6366f1; --accent-bg:#eef2ff;
   --success:#059669; --success-bg:#ecfdf5;
   --danger:#dc2626; --danger-bg:#fef2f2;
@@ -468,7 +494,6 @@ body{
 .icon-sm{width:16px;height:16px}
 .icon-lg{width:28px;height:28px}
 
-/* HEADER */
 .hero{padding:22px 0 18px;text-align:center}
 .logo{
   display:inline-flex;align-items:center;justify-content:center;
@@ -480,7 +505,6 @@ body{
 .hero h1{font-size:22px;font-weight:800;letter-spacing:-.5px;margin-bottom:6px}
 .hero p{color:var(--muted);font-size:13px;font-weight:500}
 
-/* CARD (service) */
 .card{
   background:#fff;border:1.5px solid var(--border);
   border-radius:16px;padding:16px;
@@ -496,14 +520,12 @@ body{
 .card .badge{background:var(--danger);color:#fff;font-size:9px;font-weight:800;padding:3px 8px;border-radius:99px;letter-spacing:.3px}
 .card .arrow{color:var(--muted)}
 
-/* BACK */
 .back{display:inline-flex;align-items:center;gap:6px;background:var(--bg-alt);border:1px solid var(--border);color:var(--text);padding:8px 14px;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;margin-bottom:16px}
 .back:active{transform:scale(.95)}
 
-/* PANEL */
 .panel{background:#fff;border:1.5px solid var(--border);border-radius:18px;padding:20px 18px}
 .panel .ttl{font-size:17px;font-weight:800;margin-bottom:4px}
-.panel .desc{font-size:12px;color:var(--muted);margin-bottom:18px}
+.panel .desc{font-size:12px;color:var(--muted);margin-bottom:18px;line-height:1.5}
 
 .field{margin-bottom:14px}
 .field label{display:block;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px}
@@ -511,9 +533,12 @@ body{
   width:100%;background:var(--bg-alt);border:1.5px solid var(--border);
   border-radius:12px;padding:13px 14px;color:var(--text);
   font-size:15px;font-weight:500;outline:none;transition:.2s;
+  font-family:inherit;
 }
 .field input:focus{border-color:var(--accent);background:#fff;box-shadow:0 0 0 3px var(--accent-bg)}
 .field input::placeholder{color:#94a3b8;font-weight:400}
+.field .hint{font-size:11px;color:var(--muted);margin-top:5px;line-height:1.4}
+.field .hint code{background:var(--bg-alt);padding:1px 5px;border-radius:4px;font-size:10px;color:var(--accent);font-weight:600}
 
 .btn{
   width:100%;padding:14px;border:none;border-radius:12px;
@@ -526,7 +551,6 @@ body{
 .btn:disabled{opacity:.6;pointer-events:none}
 .btn.ghost{background:var(--bg-alt);color:var(--text);border:1.5px solid var(--border);box-shadow:none}
 
-/* RESULT VIEW */
 .status-bar{
   display:flex;align-items:center;gap:8px;
   padding:10px 14px;border-radius:12px;
@@ -567,7 +591,7 @@ body{
   font-size:10px;font-weight:800;border-radius:6px;
 }
 .code-val{flex:1;font-family:'SF Mono','Monaco',monospace;font-weight:700;font-size:13.5px;letter-spacing:.5px;color:var(--text);overflow:hidden;text-overflow:ellipsis}
-.code-status{font-size:10.5px;font-weight:700;padding:3px 8px;border-radius:6px;letter-spacing:.2px;flex-shrink:0;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.code-status{font-size:10.5px;font-weight:700;padding:3px 8px;border-radius:6px;letter-spacing:.2px;flex-shrink:0;max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .code-status.success{background:var(--success-bg);color:var(--success)}
 .code-status.fail{background:var(--danger-bg);color:var(--danger)}
 .code-status.pending{background:var(--warn-bg);color:var(--warn)}
@@ -575,8 +599,7 @@ body{
 
 .empty{padding:40px 20px;text-align:center;color:var(--muted);font-size:13px}
 
-/* toast */
-.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#0f172a;color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;font-weight:600;z-index:9999;transition:.25s;box-shadow:0 8px 24px rgba(0,0,0,.25)}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#0f172a;color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;font-weight:600;z-index:9999;transition:.25s;box-shadow:0 8px 24px rgba(0,0,0,.25);max-width:90vw;text-align:center}
 </style>
 </head>
 <body>
@@ -606,7 +629,7 @@ body{
   </button>
   <div class="panel">
     <div class="ttl">Kết nối Telegram</div>
-    <div class="desc">Nhập API ID & Hash từ my.telegram.org</div>
+    <div class="desc">Lấy API ID & Hash tại <b>my.telegram.org</b></div>
     <div class="field"><label>API ID</label><input type="number" id="apiId" placeholder="12345678" autocomplete="off"></div>
     <div class="field"><label>API HASH</label><input type="password" id="apiHash" placeholder="Nhập API HASH" autocomplete="off"></div>
     <div class="field"><label>Số điện thoại</label><input type="tel" id="phone" placeholder="+84987654321" autocomplete="off"></div>
@@ -644,9 +667,21 @@ body{
 <div id="view-lc79" class="view">
   <div class="panel">
     <div class="ttl">Đăng nhập LC79</div>
-    <div class="desc">Mật khẩu sẽ được tự động mã hóa MD5 bảo mật</div>
-    <div class="field"><label>Tài khoản LC79</label><input type="text" id="lc79User" placeholder="username" autocomplete="off"></div>
-    <div class="field"><label>Mật khẩu LC79 (thô)</label><input type="password" id="lc79Pass" placeholder="Nhập mật khẩu thật" autocomplete="off"></div>
+    <div class="desc">Dán <b>MD5 hash</b> (32 ký tự hex) của mật khẩu — hoặc nhập mật khẩu thô để tự hash.</div>
+    <div class="field">
+      <label>Tài khoản LC79</label>
+      <input type="text" id="lc79User" placeholder="username" autocomplete="off">
+    </div>
+    <div class="field">
+      <label>Mật khẩu (MD5 hoặc thô)</label>
+      <input type="text" id="lc79Pass" placeholder="32 hex MD5 hoặc password thật" autocomplete="off">
+      <div class="hint">💡 Nhập 32 ký tự hex → dùng luôn. Nhập password thường → tự MD5.</div>
+    </div>
+    <div class="field">
+      <label>Nickname (tùy chọn)</label>
+      <input type="text" id="lc79Nick" placeholder="Mặc định = username" autocomplete="off">
+      <div class="hint">⚠️ Chỉ điền nếu nickname trong game KHÁC username.</div>
+    </div>
     <button class="btn" id="btn-lc79" onclick="loginLC79()">Bắt đầu Auto</button>
   </div>
 </div>
@@ -683,11 +718,19 @@ function showView(id){
   window.scrollTo({top:0,behavior:'smooth'});
 }
 
+function toast(msg){
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.innerText = msg;
+  document.body.appendChild(t);
+  setTimeout(()=>{t.style.opacity='0'; setTimeout(()=>t.remove(),300);}, 3000);
+}
+
 async function sendCode(){
   const api_id = document.getElementById('apiId').value.trim();
   const api_hash = document.getElementById('apiHash').value.trim();
   const phone = document.getElementById('phone').value.trim();
-  if (!api_id || !api_hash || !phone) return alert('Nhập đủ thông tin!');
+  if (!api_id || !api_hash || !phone) return toast('Nhập đủ thông tin!');
   const btn = document.getElementById('btn-send');
   btn.disabled = true; btn.innerText = 'Đang gửi...';
   try {
@@ -696,14 +739,14 @@ async function sendCode(){
     if (d.status === 'ok') {
       auth = {...auth, api_id, api_hash, phone, phone_code_hash:d.phone_code_hash, session:d.session};
       showView('view-otp');
-    } else alert('Lỗi: '+d.message);
-  } catch(e){ alert('Lỗi kết nối!'); }
+    } else toast('Lỗi: '+d.message);
+  } catch(e){ toast('Lỗi kết nối!'); }
   finally { btn.disabled=false; btn.innerText='Gửi mã OTP'; }
 }
 
 async function verifyCode(){
   const code = document.getElementById('otpCode').value.trim();
-  if (!code) return alert('Nhập OTP!');
+  if (!code) return toast('Nhập OTP!');
   const btn = document.getElementById('btn-otp');
   btn.disabled = true; btn.innerText = 'Đang xác thực...';
   try {
@@ -711,45 +754,47 @@ async function verifyCode(){
     const d = await r.json();
     if (d.status === 'ok') { auth.session = d.session; showView('view-lc79'); }
     else if (d.status === '2fa') { auth.session = d.session; showView('view-2fa'); }
-    else alert('Lỗi: '+d.message);
-  } catch(e){ alert('Lỗi!'); }
+    else toast('Lỗi: '+d.message);
+  } catch(e){ toast('Lỗi!'); }
   finally { btn.disabled=false; btn.innerText='Xác nhận'; }
 }
 
 async function verify2FA(){
   const password = document.getElementById('pass2fa').value.trim();
-  if (!password) return alert('Nhập 2FA!');
+  if (!password) return toast('Nhập 2FA!');
   const btn = document.getElementById('btn-2fa');
   btn.disabled = true; btn.innerText = 'Đang xác thực...';
   try {
     const r = await fetch('/api/verify_2fa', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...auth, password})});
     const d = await r.json();
     if (d.status === 'ok') { auth.session = d.session; showView('view-lc79'); }
-    else alert('Lỗi: '+d.message);
-  } catch(e){ alert('Lỗi!'); }
+    else toast('Lỗi: '+d.message);
+  } catch(e){ toast('Lỗi!'); }
   finally { btn.disabled=false; btn.innerText='Đăng nhập'; }
 }
 
 async function loginLC79(){
   const username = document.getElementById('lc79User').value.trim();
   const password = document.getElementById('lc79Pass').value.trim();
-  if (!username || !password) return alert('Nhập đủ tài khoản + mật khẩu LC79!');
+  const nickname = document.getElementById('lc79Nick').value.trim();
+  if (!username || !password) return toast('Nhập đủ tài khoản + mật khẩu!');
   const btn = document.getElementById('btn-lc79');
   btn.disabled = true; btn.innerText = 'Đang đăng nhập...';
   try {
-    const r = await fetch('/api/lc79_login', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...auth, username, password})});
+    const r = await fetch('/api/lc79_login', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...auth, username, password, nickname})});
     const d = await r.json();
     if (d.status === 'ok') {
       showView('view-result');
       startPolling();
-    } else alert('Lỗi: '+d.message);
-  } catch(e){ alert('Lỗi!'); }
+    } else {
+      toast('❌ ' + d.message);
+    }
+  } catch(e){ toast('Lỗi kết nối!'); }
   finally { btn.disabled=false; btn.innerText='Bắt đầu Auto'; }
 }
 
 function startPolling(){
   if (pollTimer) clearInterval(pollTimer);
-  // Poll mỗi 100ms — cập nhật siêu nhanh
   pollTimer = setInterval(pollCodes, 100);
   pollCodes();
 }
@@ -760,14 +805,12 @@ async function pollCodes(){
     const d = await r.json();
     if (d.status !== 'ok') return;
 
-    // Cập nhật status bar
     const bar = document.getElementById('statusBar');
     const txt = document.getElementById('statusText');
     if (d.listener && d.lc79) { bar.classList.add('on'); txt.innerText = '🟢 Auto ON — Đang lắng nghe'; }
     else if (d.listener) { bar.classList.add('on'); txt.innerText = '🟡 Listener ON — Chưa login LC79'; }
     else { bar.classList.remove('on'); txt.innerText = '🔴 Offline'; }
 
-    // Cập nhật codes nếu version thay đổi
     if (d.version !== lastVersion) {
       lastVersion = d.version;
       renderCodes(d.codes);
@@ -790,7 +833,7 @@ function renderCodes(codes){
     return `<div class="code-row">
       <div class="code-num">${num}</div>
       <div class="code-val">${c.code}</div>
-      <div class="code-status ${cls}">${label}</div>
+      <div class="code-status ${cls}" title="${label}">${label}</div>
     </div>`;
   }).join('');
 }
@@ -830,7 +873,7 @@ START_MESSAGE = """
 • Auto bắt tin nhắn code real-time (millisecond)
 • Tự động nhập code khi vừa xuất hiện
 • Hiển thị 10 code mới nhất, cập nhật 0.1s
-• Mật khẩu LC79 tự động băm MD5 bảo mật
+• Hỗ trợ MD5 hash trực tiếp (như config gốc)
 """
 
 KEYBOARD = InlineKeyboardMarkup([[
