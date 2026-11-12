@@ -11,7 +11,7 @@ import base64
 import uuid
 from flask import Flask, Response, request, jsonify
 
-from telethon import TelegramClient, functions
+from telethon import TelegramClient, functions, events
 from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError,
@@ -23,11 +23,13 @@ from telethon.errors import (
 )
 
 # ============ CONFIG ============
-PORT          = int(os.getenv("PORT", 10000))
-PING_INTERVAL = int(os.getenv("PING_INTERVAL", 10))
-WEBAPP_URL    = os.getenv("WEBAPP_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
-GAME_API_URL  = os.getenv("GAME_API_URL", "https://apifo88daigia.tele68.com/api")
-LOGIN_URL     = os.getenv("LOGIN_URL", "https://wlb.tele68.com/v1/lobby/auth/login")
+PORT             = int(os.getenv("PORT", 10000))
+PING_INTERVAL    = int(os.getenv("PING_INTERVAL", 10))
+WEBAPP_URL       = os.getenv("WEBAPP_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
+GAME_API_URL     = os.getenv("GAME_API_URL", "https://apifo88daigia.tele68.com/api")
+LOGIN_URL        = os.getenv("LOGIN_URL", "https://wlb.tele68.com/v1/lobby/auth/login")
+REDEEM_BASE_URL  = os.getenv("REDEEM_BASE_URL", "https://gameapi.tele68.com")
+REDEEM_PARAMS    = "/v1/giftcode/redemption?cp=R&cl=R&pf=web&at="
 
 SERVER_START_TIME = time.time()
 
@@ -84,20 +86,15 @@ async_manager = AsyncLoopManager()
 #                     API DEBUG LOGGER
 # ================================================================
 class ApiLogger:
-    """Log request/response có timestamp, redact dữ liệu nhạy cảm, thread-safe."""
-
     SENSITIVE_KEYS = {
         "pw", "password", "pass", "pwd",
-        "api_hash", "apihash",
-        "code", "otp",
-        "accesstoken", "accesstoken_", "access_token",
-        "token", "jwt",
-        "authorization",
-        "sessionkey", "session_key", "session",
-        "phone_code_hash", "phonecodehash",
+        "api_hash", "apihash", "code", "otp",
+        "accesstoken", "access_token", "token", "jwt",
+        "authorization", "sessionkey", "session_key",
+        "session", "phone_code_hash", "phonecodehash",
     }
 
-    def __init__(self, max_entries=400):
+    def __init__(self, max_entries=500):
         self.entries = []
         self.lock = threading.Lock()
         self.max_entries = max_entries
@@ -120,7 +117,7 @@ class ApiLogger:
         out = {}
         for k, v in data.items():
             if self._is_sensitive(k):
-                if k.lower() in ("authorization",):
+                if k.lower() == "authorization":
                     out[k] = "Bearer ***"
                 elif k.lower() in ("pw", "password", "pass", "pwd", "code", "otp"):
                     out[k] = "***"
@@ -129,10 +126,7 @@ class ApiLogger:
             elif isinstance(v, dict):
                 out[k] = self._redact_dict(v)
             elif isinstance(v, list):
-                out[k] = [
-                    self._redact_dict(i) if isinstance(i, dict) else i
-                    for i in v
-                ]
+                out[k] = [self._redact_dict(i) if isinstance(i, dict) else i for i in v]
             else:
                 out[k] = v
         return out
@@ -167,9 +161,8 @@ class ApiLogger:
         if json_data:
             payload["json"] = self._redact_dict(json_data)
         if headers:
-            red = {}
-            for k, v in headers.items():
-                red[k] = "Bearer ***" if k.lower() == "authorization" else v
+            red = {k: ("Bearer ***" if k.lower() == "authorization" else v)
+                   for k, v in headers.items()}
             payload["headers"] = red
         if account:
             payload["account"] = account
@@ -235,13 +228,11 @@ class ApiClient:
                 headers=None, account=None, retry=True):
         rid = str(uuid.uuid4())[:8]
         start = time.time()
-
         self.logger.log_request(
             request_id=rid, method=method, url=url,
             params=params, json_data=json_data,
             headers=headers, account=account,
         )
-
         attempt = 0
         last_error = None
         max_attempts = (self.max_retries + 1) if retry else 1
@@ -255,41 +246,30 @@ class ApiClient:
                     timeout=(self.connect_timeout, self.read_timeout),
                 )
                 elapsed = time.time() - start
-
                 try:
                     body = resp.json()
                 except Exception:
                     body = None
-
                 self.logger.log_response(
                     request_id=rid, status=resp.status_code,
                     body=body if body is not None else (resp.text[:300] or None),
                     elapsed=elapsed, account=account,
                     headers=dict(resp.headers),
                 )
-
                 return {
                     "ok": 200 <= resp.status_code < 300,
                     "status": resp.status_code,
-                    "body": body,
-                    "text": resp.text,
+                    "body": body, "text": resp.text,
                     "headers": dict(resp.headers),
-                    "elapsed": elapsed,
-                    "request_id": rid,
+                    "elapsed": elapsed, "request_id": rid,
                 }
-
-            except requests.exceptions.ConnectTimeout as e:
-                last_error = f"ConnectTimeout"
-                self.logger.log("warning", f"Connect timeout (attempt {attempt+1}/{max_attempts})",
-                                request_id=rid, account=account)
-            except requests.exceptions.ReadTimeout as e:
-                last_error = f"ReadTimeout"
-                self.logger.log("warning", f"Read timeout (attempt {attempt+1}/{max_attempts})",
-                                request_id=rid, account=account)
-            except requests.exceptions.ConnectionError as e:
-                last_error = f"ConnectionError: {str(e)[:120]}"
-                self.logger.log("warning", f"Connection error (attempt {attempt+1}/{max_attempts})",
-                                request_id=rid, account=account)
+            except (requests.exceptions.ConnectTimeout,
+                    requests.exceptions.ReadTimeout,
+                    requests.exceptions.ConnectionError) as e:
+                last_error = f"{type(e).__name__}: {str(e)[:120]}"
+                self.logger.log("warning",
+                    f"Network error (attempt {attempt+1}/{max_attempts})",
+                    request_id=rid, account=account)
             except Exception as e:
                 last_error = f"{type(e).__name__}: {str(e)[:120]}"
                 self.logger.log("error", f"Request exception: {last_error}",
@@ -317,7 +297,6 @@ class ApiClient:
 #                     GAME ACCOUNT + MANAGER
 # ================================================================
 def parse_jwt_exp(token):
-    """Đọc trường exp trong JWT. Trả 0 nếu không đọc được."""
     try:
         parts = token.split(".")
         if len(parts) < 2:
@@ -333,22 +312,18 @@ def parse_jwt_exp(token):
 class GameAccount:
     def __init__(self, username, pw_hash, nickname, vin=0, xu=0):
         self.username = username
-        self.pw_hash = pw_hash          # MD5, không phải plaintext
+        self.pw_hash = pw_hash
         self.nickname = nickname
         self.vin = vin
         self.xu = xu
         self.login_time = time.time()
-
         self.access_token = None
         self.access_token_time = 0.0
-
         self.jwt = None
         self.jwt_exp = 0
-
         self._refresh_lock = threading.Lock()
 
     def is_jwt_valid(self):
-        """JWT còn hạn không. JWT không có exp → coi là KHÔNG hợp lệ."""
         if not self.jwt or not self.jwt_exp:
             return False
         return time.time() < (self.jwt_exp - 60)
@@ -360,8 +335,6 @@ class GameAccount:
 
 
 class GameAccountManager:
-    """Quản lý account toàn cục. Reuse token giữa các session."""
-
     def __init__(self, api_client, logger_):
         self.accounts = {}
         self.lock = threading.Lock()
@@ -372,19 +345,15 @@ class GameAccountManager:
         with self.lock:
             if username in self.accounts:
                 acc = self.accounts[username]
-                # Password đổi → reset tokens
                 if acc.pw_hash != pw_hash:
                     acc.pw_hash = pw_hash
                     acc.access_token = None
                     acc.access_token_time = 0.0
                     acc.jwt = None
                     acc.jwt_exp = 0
-                if nickname:
-                    acc.nickname = nickname
-                if vin:
-                    acc.vin = vin
-                if xu:
-                    acc.xu = xu
+                if nickname: acc.nickname = nickname
+                if vin: acc.vin = vin
+                if xu: acc.xu = xu
                 acc.login_time = time.time()
                 return acc
             acc = GameAccount(username, pw_hash, nickname or username, vin, xu)
@@ -395,109 +364,72 @@ class GameAccountManager:
         with self.lock:
             return self.accounts.get(username)
 
-    # ---------- internal (no lock) ----------
     def _fetch_access_token(self, account):
         self.logger.log("info", "Bắt đầu lấy Access Token", account=account.username)
-
         resp = self.api_client.get(
             GAME_API_URL,
-            params={
-                "c": "3", "un": account.username, "pw": account.pw_hash,
-                "cp": "R", "cl": "R", "pf": "web", "at": "",
-            },
+            params={"c": "3", "un": account.username, "pw": account.pw_hash,
+                    "cp": "R", "cl": "R", "pf": "web", "at": ""},
             headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
             account=account.username,
         )
-
         if not resp["ok"]:
             msg = resp.get("error") or f"HTTP {resp['status']}"
             self.logger.log("error", f"Access Token thất bại: {msg}",
                             account=account.username)
             return {"status": "error", "message": msg}
-
         body = resp.get("body") or {}
         if not body.get("success"):
-            return {
-                "status": "error",
-                "message": body.get("message") or "API không trả success",
-            }
-
+            return {"status": "error",
+                    "message": body.get("message") or "API không trả success"}
         token = body.get("accessToken") or body.get("access_token")
         if not token:
-            self.logger.log("warning",
-                            "Không tìm thấy accessToken trong response",
+            self.logger.log("warning", "Không tìm thấy accessToken",
                             account=account.username,
                             structure=self._structure_only(body))
             return {"status": "error", "message": "Response thiếu accessToken"}
-
         account.access_token = token
         account.access_token_time = time.time()
-        self.logger.log("success", "Đã lấy Access Token",
-                        account=account.username)
-        return {
-            "status": "ok",
-            "token_preview": token[:6] + "..." + token[-4:] if len(token) > 12 else "***",
-        }
+        self.logger.log("success", "Đã lấy Access Token", account=account.username)
+        return {"status": "ok",
+                "token_preview": token[:6] + "..." + token[-4:] if len(token) > 12 else "***"}
 
     def _fetch_jwt(self, account):
         self.logger.log("info", "Bắt đầu login JWT", account=account.username)
-
         headers = {
             "content-type": "application/json",
             "origin": "https://lc79b.bet",
             "referer": "https://lc79b.bet/",
             "user-agent": "Mozilla/5.0",
         }
-        payload = {
-            "nickName": account.nickname,
-            "accessToken": account.access_token,
-        }
-
-        resp = self.api_client.post(
-            LOGIN_URL, headers=headers, json_data=payload,
-            account=account.username,
-        )
-
+        payload = {"nickName": account.nickname, "accessToken": account.access_token}
+        resp = self.api_client.post(LOGIN_URL, headers=headers,
+                                    json_data=payload, account=account.username)
         if not resp["ok"]:
             msg = resp.get("error") or f"HTTP {resp['status']}"
             self.logger.log("error", f"JWT login thất bại: {msg}",
                             account=account.username)
             return {"status": "error", "message": msg}
-
         body = resp.get("body") or {}
-
-        # Thử nhiều vị trí có thể chứa token
-        token = (
-            body.get("token")
-            or body.get("jwt")
-            or (body.get("data") or {}).get("token")
-            or (body.get("data") or {}).get("jwt")
-            or (body.get("data") or {}).get("accessToken")
-        )
-
+        token = (body.get("token") or body.get("jwt")
+                 or (body.get("data") or {}).get("token")
+                 or (body.get("data") or {}).get("jwt")
+                 or (body.get("data") or {}).get("accessToken"))
         if not token:
-            self.logger.log("warning",
-                            "Không xác định được trường JWT",
+            self.logger.log("warning", "Không xác định được trường JWT",
                             account=account.username,
                             structure=self._structure_only(body))
-            return {
-                "status": "error",
-                "message": "Không xác định được trường JWT. Xem API Log để kiểm tra.",
-            }
-
+            return {"status": "error",
+                    "message": "Không xác định được trường JWT. Xem API Log."}
         account.jwt = token
         account.jwt_exp = parse_jwt_exp(token)
         remain = account.jwt_remaining_minutes()
-
         self.logger.log("success", f"Đã có JWT (còn ~{remain} phút)",
                         account=account.username)
-        return {
-            "status": "ok",
-            "jwt_preview": token[:6] + "..." + token[-4:] if len(token) > 12 else "***",
-            "exp": account.jwt_exp,
-            "expires_in_minutes": remain,
-            "has_exp": bool(account.jwt_exp),
-        }
+        return {"status": "ok",
+                "jwt_preview": token[:6] + "..." + token[-4:] if len(token) > 12 else "***",
+                "exp": account.jwt_exp, "expires_in_minutes": remain,
+                "has_exp": bool(account.jwt_exp)}
 
     @staticmethod
     def _structure_only(data, depth=0):
@@ -513,7 +445,6 @@ class GameAccountManager:
                 out[k] = f"<{type(v).__name__}>"
         return out
 
-    # ---------- public ----------
     def get_access_token(self, account):
         if not account._refresh_lock.acquire(timeout=15):
             return {"status": "error", "message": "Đang xử lý, vui lòng chờ"}
@@ -524,22 +455,16 @@ class GameAccountManager:
 
     def get_jwt(self, account, force=False):
         if not force and account.is_jwt_valid():
-            return {
-                "status": "ok", "cached": True,
-                "exp": account.jwt_exp,
-                "expires_in_minutes": account.jwt_remaining_minutes(),
-                "has_exp": bool(account.jwt_exp),
-            }
+            return {"status": "ok", "cached": True, "exp": account.jwt_exp,
+                    "expires_in_minutes": account.jwt_remaining_minutes(),
+                    "has_exp": bool(account.jwt_exp)}
         if not account._refresh_lock.acquire(timeout=20):
             return {"status": "error", "message": "Đang xử lý, vui lòng chờ"}
         try:
             if not force and account.is_jwt_valid():
-                return {
-                    "status": "ok", "cached": True,
-                    "exp": account.jwt_exp,
-                    "expires_in_minutes": account.jwt_remaining_minutes(),
-                    "has_exp": bool(account.jwt_exp),
-                }
+                return {"status": "ok", "cached": True, "exp": account.jwt_exp,
+                        "expires_in_minutes": account.jwt_remaining_minutes(),
+                        "has_exp": bool(account.jwt_exp)}
             if not account.access_token:
                 res = self._fetch_access_token(account)
                 if res["status"] != "ok":
@@ -549,7 +474,6 @@ class GameAccountManager:
             account._refresh_lock.release()
 
     def refresh_jwt(self, account):
-        """Force re-fetch cả access token + JWT."""
         if not account._refresh_lock.acquire(timeout=20):
             return {"status": "error", "message": "Đang xử lý, vui lòng chờ"}
         try:
@@ -569,10 +493,144 @@ api_client = ApiClient(api_logger)
 account_manager = GameAccountManager(api_client, api_logger)
 
 
+# ================================================================
+#             REDEEM ENGINE — FAST, PARALLEL, NO-RETRY
+# ================================================================
+_fast_session = requests.Session()
+_fast_session.headers.update({
+    "user-agent": "Mozilla/5.0",
+    "origin": "https://lc79.to",
+    "referer": "https://lc79.to/",
+    "accept": "application/json, text/plain, */*",
+})
+
+
+def _warm_redeem_connection():
+    """Pre-establish TCP+TLS tới game API. Giảm ~100-150ms lần redeem đầu."""
+    try:
+        _fast_session.head(REDEEM_BASE_URL, timeout=3, allow_redirects=False)
+        logger.info("🔥 Redeem connection pre-warmed")
+    except Exception as e:
+        logger.debug(f"warm failed: {e}")
+
+
+def code_variants(raw):
+    """Trả danh sách format của code để bắn song song (nếu có prefix)."""
+    if not raw:
+        return []
+    raw = raw.strip().upper()
+    if raw.startswith("LC79") and len(raw) > 4:
+        stripped = raw[4:].strip()
+        return [raw, stripped] if stripped else [raw]
+    if raw.endswith("LC79") and len(raw) > 4:
+        stripped = raw[:-4].strip()
+        return [raw, stripped] if stripped else [raw]
+    return [raw]
+
+
+def extract_code_candidates(text):
+    """Trích mã thô từ tin nhắn. Trả về list raw code (chưa strip)."""
+    if not text:
+        return []
+    out = []
+    for m in re.findall(r'LC79[A-Z0-9]{3,}', text):
+        if m not in out:
+            out.append(m)
+    for m in re.findall(r'Mã code là[:\s]*([A-Z0-9]+)', text, re.IGNORECASE):
+        c = m.strip().upper()
+        if c and c not in out:
+            out.append(c)
+    return out
+
+
+def _single_redeem(account, code):
+    """Bắn 1 request redeem. Không retry. Dùng pre-warmed connection pool."""
+    jwt = account.jwt
+    if not jwt:
+        return {"status": "error", "http": 0,
+                "code": code, "message": "no JWT", "elapsed": 0}
+
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {jwt}",
+    }
+    start = time.time()
+    try:
+        resp = _fast_session.post(
+            REDEEM_BASE_URL + REDEEM_PARAMS,
+            headers=headers,
+            json={"code": code, "captcha": ""},
+            timeout=(3, 8),
+        )
+        elapsed = time.time() - start
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"raw_text": resp.text[:200]}
+        return {
+            "status": "ok" if 200 <= resp.status_code < 300 else "error",
+            "http": resp.status_code,
+            "body": body,
+            "code": code,
+            "elapsed": elapsed,
+        }
+    except requests.exceptions.Timeout:
+        return {"status": "error", "http": 0, "code": code,
+                "message": "timeout", "elapsed": time.time() - start}
+    except Exception as e:
+        return {"status": "error", "http": 0, "code": code,
+                "message": str(e)[:150], "elapsed": time.time() - start}
+
+
+def redeem_code_fast(account, candidates):
+    """
+    Fire tất cả candidates song song. Trả về kết quả đầu tiên thắng (200/201)
+    hoặc kết quả chậm nhất nếu tất cả fail.
+    """
+    if not candidates:
+        return {"status": "error", "http": 0, "message": "no candidates"}
+
+    if not account.is_jwt_valid():
+        r = account_manager.refresh_jwt(account)
+        if r.get("status") != "ok":
+            return {"status": "error", "http": 0,
+                    "message": "JWT invalid: " + r.get("message", "")}
+
+    if len(candidates) == 1:
+        return _single_redeem(account, candidates[0])
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    ex = ThreadPoolExecutor(max_workers=len(candidates))
+    futures = [ex.submit(_single_redeem, account, c) for c in candidates]
+    winner = None
+    try:
+        for f in as_completed(futures):
+            try:
+                r = f.result()
+            except Exception:
+                continue
+            if r.get("http") in (200, 201):
+                winner = r
+                break
+    finally:
+        ex.shutdown(wait=False)
+
+    if winner:
+        return winner
+    # Trả về 1 kết quả bất kỳ (fail case)
+    for f in futures:
+        if f.done() and not f.cancelled():
+            try:
+                return f.result()
+            except Exception:
+                pass
+    return {"status": "error", "http": 0, "message": "all attempts failed"}
+
+
 # ============ TELEGRAM SESSION STORAGE ============
 sessions = {}
 SESSIONS_LOCK = threading.Lock()
-SESSION_TTL = 600
+SESSION_TTL = 1800  # 30 phút (auto-watch cần giữ session lâu hơn)
 
 
 def cleanup_old_sessions():
@@ -585,7 +643,6 @@ def cleanup_old_sessions():
                 for sid, s in list(sessions.items()):
                     if now - s["created"] > SESSION_TTL:
                         expired_ids.append(sid)
-
             for sid in expired_ids:
                 with SESSIONS_LOCK:
                     s = sessions.pop(sid, None)
@@ -601,50 +658,35 @@ def cleanup_old_sessions():
 
 # ============ GAME LOGIN (SYNC) ============
 def login_game_sync(username, password):
-    """Giữ logic cũ, thêm capture accessToken + lưu account."""
     try:
         pw_hash = hashlib.md5(password.encode("utf-8")).hexdigest()
-        params = {
-            "c": 3, "un": username, "pw": pw_hash,
-            "cp": "R", "cl": "R", "pf": "web", "at": "",
-        }
+        params = {"c": 3, "un": username, "pw": pw_hash,
+                  "cp": "R", "cl": "R", "pf": "web", "at": ""}
         api_logger.log_request(
             request_id="login-" + str(uuid.uuid4())[:6],
             method="GET", url=GAME_API_URL,
             params=params, account=username,
         )
-
         start = time.time()
         resp = requests.get(GAME_API_URL, params=params, timeout=15)
         elapsed = time.time() - start
-
         if resp.status_code >= 500:
-            api_logger.log_response(
-                request_id="login", status=resp.status_code,
-                elapsed=elapsed, account=username,
-            )
+            api_logger.log_response(request_id="login", status=resp.status_code,
+                                    elapsed=elapsed, account=username)
             return {"status": "error",
                     "message": f"Server game lỗi (HTTP {resp.status_code})"}
-
         try:
             result = resp.json()
         except Exception:
-            api_logger.log_response(
-                request_id="login", status=resp.status_code,
-                elapsed=elapsed, account=username,
-                error="JSON parse error",
-            )
+            api_logger.log_response(request_id="login", status=resp.status_code,
+                                    elapsed=elapsed, account=username,
+                                    error="JSON parse error")
             return {"status": "error", "message": "API game trả dữ liệu không hợp lệ"}
-
-        api_logger.log_response(
-            request_id="login", status=resp.status_code,
-            body=result, elapsed=elapsed, account=username,
-        )
-
+        api_logger.log_response(request_id="login", status=resp.status_code,
+                                body=result, elapsed=elapsed, account=username)
         if not result.get("success"):
             return {"status": "error",
                     "message": result.get("message") or "Sai tài khoản hoặc mật khẩu game!"}
-
         user_info = {}
         session_key = result.get("sessionKey", "")
         if session_key:
@@ -652,31 +694,19 @@ def login_game_sync(username, password):
                 user_info = json.loads(base64.b64decode(session_key).decode("utf-8"))
             except Exception:
                 pass
-
         nickname = user_info.get("nickname") or username
         vin = user_info.get("vinTotal", 0)
         xu = user_info.get("xuTotal", 0)
-
-        account = account_manager.get_or_create(
-            username, pw_hash, nickname, vin, xu
-        )
-
-        # Lưu accessToken luôn nếu response có
+        account = account_manager.get_or_create(username, pw_hash, nickname, vin, xu)
         access_token = result.get("accessToken") or result.get("access_token")
         if access_token:
             account.access_token = access_token
             account.access_token_time = time.time()
             api_logger.log("success", "Đã capture Access Token từ login",
                            account=username)
-
-        return {
-            "status": "ok",
-            "username": nickname,
-            "balance": vin,
-            "xuTotal": xu,
-            "access_token_ready": bool(account.access_token),
-            "login_time": account.login_time,
-        }
+        return {"status": "ok", "username": nickname, "balance": vin, "xuTotal": xu,
+                "access_token_ready": bool(account.access_token),
+                "login_time": account.login_time}
     except Exception as e:
         api_logger.log("error", f"login_game exception: {type(e).__name__}: {e}")
         return {"status": "error", "message": f"Lỗi kết nối: {e}"}
@@ -684,7 +714,6 @@ def login_game_sync(username, password):
 
 # ============ TELEGRAM CODE ENGINE ============
 async def _async_fetch_codes(client, session_data):
-    """Quét kênh LC79, trả về items có metadata + log quá trình."""
     scan_log = []
     now = time.time()
 
@@ -692,7 +721,6 @@ async def _async_fetch_codes(client, session_data):
         scan_log.append({"ts": time.time(), "level": level, "message": msg})
 
     _log("info", "Bắt đầu quét kênh LC79")
-
     channel_entity = None
     try:
         async for dialog in client.iter_dialogs(limit=200):
@@ -707,123 +735,306 @@ async def _async_fetch_codes(client, session_data):
     if not channel_entity:
         try:
             channel_entity = await client.get_entity('codelaucuagame')
-            _log("info", "Resolve kênh qua username thành công")
+            _log("info", "Resolve username thành công")
         except Exception as e:
-            _log("warning", f"Resolve username thất bại: {str(e)[:80]}")
-
+            _log("warning", f"Resolve username fail: {str(e)[:80]}")
     if not channel_entity:
         try:
             channel_entity = await client.get_entity(-1002237214360)
-            _log("info", "Resolve kênh qua ID thành công")
+            _log("info", "Resolve ID thành công")
         except Exception:
             pass
-
     if not channel_entity:
         _log("error", "Không tìm thấy kênh LC79")
-        return {
-            "status": "error",
-            "message": "Không tìm thấy kênh LC79. Tài khoản chưa join hoặc kênh ẩn.",
-            "scan_log": scan_log,
-        }
+        return {"status": "error",
+                "message": "Không tìm thấy kênh LC79. Tài khoản chưa join hoặc kênh ẩn.",
+                "scan_log": scan_log}
 
     _log("success", "Đã resolve kênh LC79")
-
     try:
         await client(functions.channels.JoinChannelRequest(channel=channel_entity))
     except Exception:
         pass
 
-    # Đảm bảo session_data có codes_seen
-    if "codes_seen" not in session_data:
-        session_data["codes_seen"] = {}
-
+    session_data.setdefault("codes_seen", {})
     items = []
     seen_in_scan = set()
     msg_count = 0
-
-    pattern_lc79 = re.compile(r'LC79[A-Z0-9]{3,}')
-    pattern_ma = re.compile(r'Mã code là[:\s]*([A-Z0-9]+)', re.IGNORECASE)
 
     async for msg in client.iter_messages(channel_entity, limit=100):
         msg_count += 1
         raw_text = getattr(msg, 'message', '') or getattr(msg, 'text', '') or ''
         if not raw_text:
             continue
-
         msg_date = msg.date.timestamp() if getattr(msg, 'date', None) else now
-
-        # Tìm cả 2 format
-        found_raw = []
-        for m in pattern_lc79.findall(raw_text):
-            if m not in found_raw:
-                found_raw.append(m)
-        for m in pattern_ma.findall(raw_text):
-            candidate = m.strip()
-            if candidate and candidate not in found_raw:
-                found_raw.append(candidate)
-
-        for raw in found_raw:
-            # Strip LC79 prefix (nếu có)
-            stripped = raw
-            if stripped.startswith("LC79"):
-                stripped = stripped[4:].strip()
-            if not stripped or stripped in seen_in_scan:
+        for raw in extract_code_candidates(raw_text):
+            variants = code_variants(raw)
+            if not variants:
                 continue
-            seen_in_scan.add(stripped)
-
-            is_new = stripped not in session_data["codes_seen"]
-            first_seen = session_data["codes_seen"].get(stripped, {}).get(
-                "first_seen", now
-            )
+            # Use first (stripped) variant as canonical ID
+            canonical = variants[-1] if len(variants) > 1 else variants[0]
+            if canonical in seen_in_scan:
+                continue
+            seen_in_scan.add(canonical)
+            is_new = canonical not in session_data["codes_seen"]
+            first_seen = session_data["codes_seen"].get(canonical, {}).get(
+                "first_seen", now)
             if is_new:
-                session_data["codes_seen"][stripped] = {
-                    "first_seen": now,
-                    "msg_date": msg_date,
+                session_data["codes_seen"][canonical] = {
+                    "first_seen": now, "msg_date": msg_date,
                     "msg_id": getattr(msg, "id", 0),
                 }
                 first_seen = now
-
             items.append({
-                "code": stripped,
-                "raw": raw,
-                "found_at": now,
-                "first_seen": first_seen,
-                "msg_date": msg_date,
-                "msg_id": getattr(msg, "id", 0),
+                "code": canonical, "raw": raw,
+                "found_at": now, "first_seen": first_seen,
+                "msg_date": msg_date, "msg_id": getattr(msg, "id", 0),
                 "status": "new" if is_new else "seen",
             })
-
             if len(items) >= 10:
                 break
         if len(items) >= 10:
             break
 
-    _log("info", f"Đã quét {msg_count} tin nhắn, tìm {len(items)} mã")
-
+    _log("info", f"Đã quét {msg_count} tin, tìm {len(items)} mã")
     if not items:
         _log("warning", "Không có mã LC79 trong 100 tin gần nhất")
-        return {
-            "status": "error",
-            "message": "Không tìm thấy code LC79 trong 100 tin gần nhất.",
-            "scan_log": scan_log,
-        }
+        return {"status": "error",
+                "message": "Không tìm thấy code LC79 trong 100 tin gần nhất.",
+                "scan_log": scan_log}
 
     new_count = sum(1 for it in items if it["status"] == "new")
     _log("success", f"Hoàn tất: {len(items)} mã ({new_count} mới)")
-
-    # Lưu scan log vào session (giới hạn 300)
     session_data.setdefault("scan_log", [])
     session_data["scan_log"].extend(scan_log)
     session_data["scan_log"] = session_data["scan_log"][-300:]
 
-    return {
-        "status": "ok",
-        "codes": [it["code"] for it in items],   # backward compat
-        "items": items,
-        "new_count": new_count,
-        "total_count": len(items),
-        "scan_log": scan_log,
-    }
+    return {"status": "ok",
+            "codes": [it["code"] for it in items],
+            "items": items, "new_count": new_count, "total_count": len(items),
+            "scan_log": scan_log}
+
+
+# ================================================================
+#                   AUTO-WATCH (REAL-TIME LISTENER)
+# ================================================================
+def _add_auto_event(session_id, event):
+    with SESSIONS_LOCK:
+        s = sessions.get(session_id)
+    if not s:
+        return
+    s.setdefault("auto_events", [])
+    s["auto_events"].append(event)
+    if len(s["auto_events"]) > 100:
+        s["auto_events"] = s["auto_events"][-100:]
+
+
+def _auto_redeem_worker(session_id, candidates, raw_code, msg_ts):
+    """Thread: fire redeem ngay lập tức. Không block async loop."""
+    try:
+        with SESSIONS_LOCK:
+            s = sessions.get(session_id)
+        if not s:
+            return
+
+        # Dedup
+        redeemed = s.setdefault("redeemed_codes", [])
+        if raw_code in redeemed:
+            return
+        redeemed.append(raw_code)
+        if len(redeemed) > 300:
+            s["redeemed_codes"] = redeemed[-300:]
+
+        username = s.get("game_username")
+        if not username:
+            _add_auto_event(session_id, {
+                "ts": time.time(), "code": raw_code,
+                "status": "skipped", "message": "Chưa login game",
+                "msg_ts": msg_ts,
+                "delay_ms": int((time.time() - msg_ts) * 1000),
+            })
+            return
+
+        account = account_manager.get(username)
+        if not account:
+            _add_auto_event(session_id, {
+                "ts": time.time(), "code": raw_code,
+                "status": "skipped", "message": "Không tìm thấy account",
+                "msg_ts": msg_ts,
+                "delay_ms": int((time.time() - msg_ts) * 1000),
+            })
+            return
+
+        fire_ts = time.time()
+        api_logger.log("info", f"⚡ Auto-redeem: {raw_code}",
+                       account=username, candidates=candidates)
+        result = redeem_code_fast(account, candidates)
+        elapsed = time.time() - fire_ts
+        total_elapsed = time.time() - msg_ts
+
+        http = result.get("http", 0)
+        body = result.get("body") or {}
+        is_ok = http in (200, 201)
+        amount = None
+        msg = result.get("message")
+        if isinstance(body, dict):
+            amount = (body.get("money") or body.get("amount")
+                      or body.get("reward")
+                      or (body.get("data") or {}).get("money"))
+            msg = msg or body.get("message")
+
+        _add_auto_event(session_id, {
+            "ts": fire_ts,
+            "msg_ts": msg_ts,
+            "code": raw_code,
+            "candidates": candidates,
+            "http": http,
+            "elapsed_ms": int(elapsed * 1000),
+            "total_ms": int(total_elapsed * 1000),
+            "delay_ms": int((fire_ts - msg_ts) * 1000),
+            "status": "success" if is_ok else "fail",
+            "amount": amount,
+            "message": msg,
+        })
+        api_logger.log(
+            "success" if is_ok else "error",
+            f"Redeem {raw_code}: HTTP {http} ({int(elapsed*1000)}ms)",
+            account=username,
+        )
+    except Exception as e:
+        logger.error(f"_auto_redeem_worker err: {e}")
+
+
+async def _async_start_auto_watch(session_id):
+    with SESSIONS_LOCK:
+        s = sessions.get(session_id)
+    if not s:
+        return {"status": "error", "message": "Session không tồn tại"}
+    if s.get("auto_watch_handler"):
+        return {"status": "ok", "message": "Đã bật từ trước"}
+
+    username = s.get("game_username")
+    if not username:
+        return {"status": "error", "message": "Chưa login game — không thể bật auto"}
+
+    account = account_manager.get(username)
+    if not account:
+        return {"status": "error", "message": "Không tìm thấy account"}
+
+    # Pre-warm JWT trước khi bật
+    if not account.is_jwt_valid():
+        r = account_manager.refresh_jwt(account)
+        if r.get("status") != "ok":
+            return {"status": "error",
+                    "message": f"Không lấy được JWT: {r.get('message', '')}"}
+
+    client = s["client"]
+    if not client.is_connected():
+        try:
+            await client.connect()
+        except Exception as e:
+            return {"status": "error", "message": f"Mất kết nối: {e}"}
+
+    channel_entity = None
+    try:
+        async for dialog in client.iter_dialogs(limit=200):
+            if (dialog.entity and getattr(dialog.entity, 'username', '') == 'codelaucuagame') \
+               or dialog.id == -1002237214360:
+                channel_entity = dialog.entity
+                break
+    except Exception:
+        pass
+    if not channel_entity:
+        try: channel_entity = await client.get_entity('codelaucuagame')
+        except Exception: pass
+    if not channel_entity:
+        try: channel_entity = await client.get_entity(-1002237214360)
+        except Exception: pass
+    if not channel_entity:
+        return {"status": "error", "message": "Không tìm thấy kênh LC79"}
+
+    try:
+        await client(functions.channels.JoinChannelRequest(channel=channel_entity))
+    except Exception:
+        pass
+
+    async def on_new_msg(event):
+        try:
+            text = event.raw_text or ""
+            raw_codes = extract_code_candidates(text)
+            if not raw_codes:
+                return
+            received_ts = time.time()
+            logger.info(f"📥 [AUTO] {len(raw_codes)} code từ tin mới")
+            for raw in raw_codes:
+                variants = code_variants(raw)
+                threading.Thread(
+                    target=_auto_redeem_worker,
+                    args=(session_id, variants, raw, received_ts),
+                    daemon=True,
+                ).start()
+        except Exception as e:
+            logger.error(f"on_new_msg err: {e}")
+
+    client.add_event_handler(on_new_msg, events.NewMessage(chats=[channel_entity]))
+    s["auto_watch_handler"] = on_new_msg
+    s["auto_watch_channel"] = channel_entity
+
+    threading.Thread(target=_warm_redeem_connection, daemon=True).start()
+    logger.info(f"🎯 Auto-watch ON cho session {session_id[:8]} / {username}")
+    return {"status": "ok", "username": username}
+
+
+async def _async_stop_auto_watch(session_id):
+    with SESSIONS_LOCK:
+        s = sessions.get(session_id)
+    if not s:
+        return {"status": "error", "message": "Session không tồn tại"}
+    handler = s.get("auto_watch_handler")
+    if not handler:
+        return {"status": "ok", "message": "Chưa bật"}
+    try:
+        s["client"].remove_event_handler(handler)
+    except Exception:
+        pass
+    s["auto_watch_handler"] = None
+    s["auto_watch_channel"] = None
+    logger.info(f"🛑 Auto-watch OFF cho session {session_id[:8]}")
+    return {"status": "ok"}
+
+
+def jwt_prewarm_loop():
+    """Background: refresh JWT cho các session auto-watch khi gần hết hạn."""
+    time.sleep(20)
+    while True:
+        try:
+            time.sleep(45)
+            with SESSIONS_LOCK:
+                active_ids = [sid for sid, s in sessions.items()
+                              if s.get("auto_watch_handler")]
+            for sid in active_ids:
+                with SESSIONS_LOCK:
+                    s = sessions.get(sid)
+                if not s:
+                    continue
+                username = s.get("game_username")
+                if not username:
+                    continue
+                acc = account_manager.get(username)
+                if not acc or not acc.jwt_exp:
+                    continue
+                remain = acc.jwt_exp - time.time()
+                if remain < 300:  # <5 phút → refresh
+                    try:
+                        r = account_manager.refresh_jwt(acc)
+                        if r.get("status") == "ok":
+                            logger.info(f"🔄 Pre-warmed JWT for {username}")
+                        else:
+                            logger.warning(f"Prewarm fail {username}: {r.get('message')}")
+                    except Exception as e:
+                        logger.warning(f"Prewarm err: {e}")
+        except Exception as e:
+            logger.error(f"jwt_prewarm_loop: {e}")
 
 
 # ================================================================
@@ -836,10 +1047,8 @@ def api_send_code():
     api_id = data.get("api_id")
     api_hash = data.get("api_hash")
     phone = data.get("phone")
-
     if not all([api_id, api_hash, phone]):
         return jsonify({"status": "error", "message": "Vui lòng nhập đủ thông tin."})
-
     phone = phone.strip().replace(" ", "").replace("-", "")
 
     async def _do():
@@ -848,21 +1057,19 @@ def api_send_code():
             client = TelegramClient(StringSession(), int(api_id), api_hash)
             await client.connect()
             sent = await client.send_code_request(phone)
-
             session_id = str(uuid.uuid4())
             with SESSIONS_LOCK:
                 sessions[session_id] = {
-                    "client": client,
-                    "phone": phone,
+                    "client": client, "phone": phone,
                     "phone_code_hash": sent.phone_code_hash,
                     "created": time.time(),
-                    "codes_seen": {},
-                    "scan_log": [],
+                    "codes_seen": {}, "scan_log": [],
                     "game_username": None,
+                    "auto_events": [], "redeemed_codes": [],
+                    "auto_watch_handler": None,
                 }
             logger.info(f"📱 Session {session_id[:8]} created for {phone}")
             return {"status": "ok", "session_id": session_id}
-
         except PhoneNumberInvalidError:
             if client and client.is_connected():
                 try: await client.disconnect()
@@ -874,7 +1081,7 @@ def api_send_code():
                 try: await client.disconnect()
                 except Exception: pass
             return {"status": "error",
-                    "message": f"Telegram giới hạn, chờ {e.seconds}s rồi thử lại."}
+                    "message": f"Telegram giới hạn, chờ {e.seconds}s."}
         except Exception as e:
             if client and client.is_connected():
                 try: await client.disconnect()
@@ -886,7 +1093,6 @@ def api_send_code():
     try:
         result = async_manager.run(_do(), timeout=45)
     except Exception as e:
-        logger.error(f"async_manager send_code fail: {e}")
         return jsonify({"status": "error", "message": f"Server lỗi: {e}"})
     return jsonify(result)
 
@@ -896,17 +1102,12 @@ def api_verify_code():
     data = request.json or {}
     session_id = data.get("session_id")
     code = (data.get("code") or "").strip().replace(" ", "").replace("-", "")
-
     if not session_id or not code:
-        return jsonify({"status": "error",
-                        "message": "Thiếu session hoặc mã OTP."})
-
+        return jsonify({"status": "error", "message": "Thiếu session hoặc mã OTP."})
     with SESSIONS_LOCK:
         s = sessions.get(session_id)
-
     if not s:
-        return jsonify({"status": "error",
-                        "message": "Phiên đã hết hạn (>10 phút). Bắt đầu lại."})
+        return jsonify({"status": "error", "message": "Phiên đã hết hạn."})
 
     async def _do():
         client = s["client"]
@@ -915,39 +1116,29 @@ def api_verify_code():
                 await client.connect()
         except Exception:
             return {"status": "error", "message": "Mất kết nối Telegram."}
-
         try:
-            await client.sign_in(
-                phone=s["phone"], code=code,
-                phone_code_hash=s["phone_code_hash"],
-            )
+            await client.sign_in(phone=s["phone"], code=code,
+                                 phone_code_hash=s["phone_code_hash"])
             logger.info(f"✅ OTP OK session {session_id[:8]}")
-            # Xoá phone_code_hash sau khi dùng xong
             s["phone_code_hash"] = None
             return {"status": "ok"}
-
         except SessionPasswordNeededError:
             return {"status": "2fa"}
         except PhoneCodeInvalidError:
             return {"status": "error", "message": "Mã OTP không đúng. Nhập lại."}
         except PhoneCodeExpiredError:
-            return {"status": "error",
-                    "message": "Mã OTP đã hết hạn. Bắt đầu lại để nhận mã mới."}
+            return {"status": "error", "message": "Mã OTP đã hết hạn."}
         except FloodWaitError as e:
-            return {"status": "error",
-                    "message": f"Thử quá nhiều lần. Chờ {e.seconds}s."}
+            return {"status": "error", "message": f"Thử quá nhiều. Chờ {e.seconds}s."}
         except AuthRestartError:
-            return {"status": "error",
-                    "message": "Telegram yêu cầu restart. Bắt đầu lại."}
+            return {"status": "error", "message": "Telegram yêu cầu restart."}
         except Exception as e:
-            logger.error(f"verify_code {type(e).__name__}: {e}")
             return {"status": "error",
                     "message": f"Lỗi: {type(e).__name__}: {str(e)[:200]}"}
 
     try:
         result = async_manager.run(_do(), timeout=45)
     except Exception as e:
-        logger.error(f"async_manager verify_code fail: {e}")
         return jsonify({"status": "error", "message": f"Server lỗi: {e}"})
     return jsonify(result)
 
@@ -957,14 +1148,10 @@ def api_verify_2fa():
     data = request.json or {}
     session_id = data.get("session_id")
     password = data.get("password") or ""
-
     if not session_id or not password:
-        return jsonify({"status": "error",
-                        "message": "Thiếu session hoặc mật khẩu."})
-
+        return jsonify({"status": "error", "message": "Thiếu session hoặc mật khẩu."})
     with SESSIONS_LOCK:
         s = sessions.get(session_id)
-
     if not s:
         return jsonify({"status": "error", "message": "Phiên đã hết hạn."})
 
@@ -975,7 +1162,6 @@ def api_verify_2fa():
                 await client.connect()
         except Exception:
             return {"status": "error", "message": "Mất kết nối."}
-
         try:
             await client.sign_in(password=password)
             logger.info(f"✅ 2FA OK session {session_id[:8]}")
@@ -987,7 +1173,6 @@ def api_verify_2fa():
     try:
         result = async_manager.run(_do(), timeout=45)
     except Exception as e:
-        logger.error(f"async_manager verify_2fa fail: {e}")
         return jsonify({"status": "error", "message": f"Server lỗi: {e}"})
     return jsonify(result)
 
@@ -998,20 +1183,15 @@ def api_login_game():
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
     session_id = data.get("session_id")
-
     if not username or not password:
         return jsonify({"status": "error",
                         "message": "Vui lòng nhập đủ Username và Mật khẩu."})
-
     result = login_game_sync(username, password)
-
-    # Tie account vào session để dùng cho token endpoints
     if result.get("status") == "ok" and session_id:
         with SESSIONS_LOCK:
             s = sessions.get(session_id)
         if s:
             s["game_username"] = username
-
     return jsonify(result)
 
 
@@ -1019,16 +1199,12 @@ def api_login_game():
 def api_get_codes():
     data = request.json or {}
     session_id = data.get("session_id")
-
     if not session_id:
         return jsonify({"status": "error", "message": "Thiếu session."})
-
     with SESSIONS_LOCK:
         s = sessions.get(session_id)
-
     if not s:
-        return jsonify({"status": "error",
-                        "message": "Phiên đã hết hạn. Bắt đầu lại."})
+        return jsonify({"status": "error", "message": "Phiên đã hết hạn."})
 
     async def _do():
         client = s["client"]
@@ -1036,21 +1212,17 @@ def api_get_codes():
             if not client.is_connected():
                 await client.connect()
         except Exception:
-            return {"status": "error", "message": "Mất kết nối. Bắt đầu lại."}
+            return {"status": "error", "message": "Mất kết nối."}
         return await _async_fetch_codes(client, s)
 
     try:
         result = async_manager.run(_do(), timeout=60)
     except Exception as e:
-        logger.error(f"async_manager get_codes fail: {e}")
         return jsonify({"status": "error", "message": f"Server lỗi: {e}"})
     return jsonify(result)
 
 
-# ---------------- TOKEN / JWT / API ENDPOINTS ----------------
-
 def _require_session_account(session_id):
-    """Helper trả về (session, account) hoặc lỗi dict."""
     if not session_id:
         return None, None, {"status": "error", "message": "Thiếu session."}
     with SESSIONS_LOCK:
@@ -1068,8 +1240,7 @@ def _require_session_account(session_id):
 
 @flask_app.route("/api/get_access_token", methods=["POST"])
 def api_get_access_token():
-    data = request.json or {}
-    _, acc, err = _require_session_account(data.get("session_id"))
+    _, acc, err = _require_session_account((request.json or {}).get("session_id"))
     if err:
         return jsonify(err)
     return jsonify(account_manager.get_access_token(acc))
@@ -1081,14 +1252,12 @@ def api_get_jwt():
     _, acc, err = _require_session_account(data.get("session_id"))
     if err:
         return jsonify(err)
-    force = bool(data.get("force"))
-    return jsonify(account_manager.get_jwt(acc, force=force))
+    return jsonify(account_manager.get_jwt(acc, force=bool(data.get("force"))))
 
 
 @flask_app.route("/api/refresh_jwt", methods=["POST"])
 def api_refresh_jwt():
-    data = request.json or {}
-    _, acc, err = _require_session_account(data.get("session_id"))
+    _, acc, err = _require_session_account((request.json or {}).get("session_id"))
     if err:
         return jsonify(err)
     return jsonify(account_manager.refresh_jwt(acc))
@@ -1096,22 +1265,15 @@ def api_refresh_jwt():
 
 @flask_app.route("/api/account_status", methods=["POST"])
 def api_account_status():
-    data = request.json or {}
-    _, acc, err = _require_session_account(data.get("session_id"))
+    _, acc, err = _require_session_account((request.json or {}).get("session_id"))
     if err:
         return jsonify(err)
-
     return jsonify({
-        "status": "ok",
-        "username": acc.username,
-        "nickname": acc.nickname,
-        "vin": acc.vin,
-        "xu": acc.xu,
-        "login_time": acc.login_time,
+        "status": "ok", "username": acc.username, "nickname": acc.nickname,
+        "vin": acc.vin, "xu": acc.xu, "login_time": acc.login_time,
         "access_token_ready": bool(acc.access_token),
         "access_token_time": acc.access_token_time,
-        "jwt_ready": bool(acc.jwt),
-        "jwt_valid": acc.is_jwt_valid(),
+        "jwt_ready": bool(acc.jwt), "jwt_valid": acc.is_jwt_valid(),
         "jwt_exp": acc.jwt_exp,
         "jwt_expires_in_minutes": acc.jwt_remaining_minutes(),
     })
@@ -1119,64 +1281,52 @@ def api_account_status():
 
 @flask_app.route("/api/check_api", methods=["POST"])
 def api_check_api():
-    """Ping nhanh 2 endpoint để xác định reachability."""
     results = {}
     overall_ok = True
-
     start = time.time()
     try:
-        resp = requests.get(
-            GAME_API_URL,
+        resp = requests.get(GAME_API_URL,
             params={"c": "3", "un": "", "pw": "", "cp": "R",
-                    "cl": "R", "pf": "web", "at": ""},
-            timeout=10,
-        )
-        results["game_api"] = {
-            "name": "Game API",
-            "url": GAME_API_URL,
+                    "cl": "R", "pf": "web", "at": ""}, timeout=10)
+        results["game_api"] = {"name": "Game API", "url": GAME_API_URL,
             "http": resp.status_code,
             "elapsed_ms": int((time.time() - start) * 1000),
-            "ok": resp.status_code < 500,
-        }
+            "ok": resp.status_code < 500}
     except Exception as e:
-        results["game_api"] = {
-            "name": "Game API", "url": GAME_API_URL,
-            "error": str(e)[:150], "ok": False,
-        }
+        results["game_api"] = {"name": "Game API", "url": GAME_API_URL,
+            "error": str(e)[:150], "ok": False}
         overall_ok = False
-
     start = time.time()
     try:
         resp = requests.post(LOGIN_URL, json={}, timeout=10)
-        results["login_url"] = {
-            "name": "JWT Login",
-            "url": LOGIN_URL,
+        results["login_url"] = {"name": "JWT Login", "url": LOGIN_URL,
             "http": resp.status_code,
             "elapsed_ms": int((time.time() - start) * 1000),
-            "ok": resp.status_code < 500,
-        }
+            "ok": resp.status_code < 500}
     except Exception as e:
-        results["login_url"] = {
-            "name": "JWT Login", "url": LOGIN_URL,
-            "error": str(e)[:150], "ok": False,
-        }
+        results["login_url"] = {"name": "JWT Login", "url": LOGIN_URL,
+            "error": str(e)[:150], "ok": False}
         overall_ok = False
-
-    return jsonify({
-        "status": "ok" if overall_ok else "warning",
-        "results": results,
-        "ts": time.time(),
-    })
+    start = time.time()
+    try:
+        resp = _fast_session.head(REDEEM_BASE_URL, timeout=5, allow_redirects=False)
+        results["redeem_api"] = {"name": "Redeem API", "url": REDEEM_BASE_URL,
+            "http": resp.status_code,
+            "elapsed_ms": int((time.time() - start) * 1000),
+            "ok": resp.status_code < 500}
+    except Exception as e:
+        results["redeem_api"] = {"name": "Redeem API", "url": REDEEM_BASE_URL,
+            "error": str(e)[:150], "ok": False}
+        overall_ok = False
+    return jsonify({"status": "ok" if overall_ok else "warning",
+                    "results": results, "ts": time.time()})
 
 
 @flask_app.route("/api/api_log", methods=["GET"])
 def api_api_log():
     limit = request.args.get("limit", 200, type=int)
-    return jsonify({
-        "status": "ok",
-        "logs": api_logger.get_logs(limit=limit),
-        "stats": api_logger.get_stats(),
-    })
+    return jsonify({"status": "ok", "logs": api_logger.get_logs(limit=limit),
+                    "stats": api_logger.get_stats()})
 
 
 @flask_app.route("/api/clear_log", methods=["POST"])
@@ -1188,6 +1338,90 @@ def api_clear_log():
 @flask_app.route("/api/stats", methods=["GET"])
 def api_stats():
     return jsonify({"status": "ok", "stats": api_logger.get_stats()})
+
+
+# ================================================================
+#           NEW: MANUAL REDEEM + AUTO-WATCH ENDPOINTS
+# ================================================================
+@flask_app.route("/api/redeem_manual", methods=["POST"])
+def api_redeem_manual():
+    data = request.json or {}
+    session_id = data.get("session_id")
+    code_input = (data.get("code") or "").strip().upper()
+    captcha = data.get("captcha", "")
+    if not session_id or not code_input:
+        return jsonify({"status": "error", "message": "Thiếu session hoặc code"})
+    with SESSIONS_LOCK:
+        s = sessions.get(session_id)
+    if not s:
+        return jsonify({"status": "error", "message": "Session hết hạn"})
+    username = s.get("game_username")
+    if not username:
+        return jsonify({"status": "error", "message": "Chưa login game"})
+    acc = account_manager.get(username)
+    if not acc:
+        return jsonify({"status": "error", "message": "Không tìm thấy account"})
+
+    variants = code_variants(code_input)
+    start = time.time()
+    result = redeem_code_fast(acc, variants)
+    elapsed = time.time() - start
+    http = result.get("http", 0)
+    body = result.get("body") or {}
+    is_ok = http in (200, 201)
+    amount = (body.get("money") or body.get("amount")
+              or body.get("reward")
+              or (body.get("data") or {}).get("money")) if isinstance(body, dict) else None
+    msg = body.get("message") if isinstance(body, dict) else result.get("message")
+
+    _add_auto_event(session_id, {
+        "ts": time.time(), "code": code_input, "candidates": variants,
+        "http": http, "elapsed_ms": int(elapsed * 1000),
+        "status": "success" if is_ok else "fail",
+        "amount": amount, "message": msg, "manual": True,
+    })
+    return jsonify({**result, "amount": amount})
+
+
+@flask_app.route("/api/toggle_auto", methods=["POST"])
+def api_toggle_auto():
+    data = request.json or {}
+    session_id = data.get("session_id")
+    enabled = bool(data.get("enabled"))
+    if not session_id:
+        return jsonify({"status": "error", "message": "Thiếu session"})
+    with SESSIONS_LOCK:
+        if session_id not in sessions:
+            return jsonify({"status": "error", "message": "Session hết hạn"})
+    try:
+        if enabled:
+            result = async_manager.run(_async_start_auto_watch(session_id), timeout=30)
+        else:
+            result = async_manager.run(_async_stop_auto_watch(session_id), timeout=15)
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Server: {e}"})
+    return jsonify(result)
+
+
+@flask_app.route("/api/auto_status", methods=["POST"])
+def api_auto_status():
+    data = request.json or {}
+    session_id = data.get("session_id")
+    if not session_id:
+        return jsonify({"status": "error", "message": "Thiếu session"})
+    with SESSIONS_LOCK:
+        s = sessions.get(session_id)
+    if not s:
+        return jsonify({"status": "error", "message": "Session hết hạn"})
+    username = s.get("game_username")
+    acc = account_manager.get(username) if username else None
+    return jsonify({
+        "status": "ok",
+        "enabled": bool(s.get("auto_watch_handler")),
+        "events": s.get("auto_events", [])[-25:],
+        "jwt_ready": bool(acc and acc.is_jwt_valid()),
+        "jwt_remaining_minutes": acc.jwt_remaining_minutes() if acc else 0,
+    })
 
 
 # ================================================================
@@ -1228,40 +1462,19 @@ body>*{position:relative;z-index:1}
 .view.active{display:block}
 @keyframes viewIn{from{opacity:0;transform:translateY(15px) scale(0.98)}to{opacity:1;transform:none}}
 .header{text-align:center;padding:30px 0 20px}
-.logo{
-  display:inline-flex;align-items:center;justify-content:center;
-  width:80px;height:80px;border-radius:24px;
-  background:linear-gradient(135deg,rgba(139,92,246,0.2),rgba(6,182,212,0.2));
-  border:1px solid rgba(139,92,246,0.4);color:var(--accent);
-  margin-bottom:20px;box-shadow:0 10px 40px rgba(139,92,246,0.2);
-  backdrop-filter:blur(10px);
-}
+.logo{display:inline-flex;align-items:center;justify-content:center;width:80px;height:80px;border-radius:24px;background:linear-gradient(135deg,rgba(139,92,246,0.2),rgba(6,182,212,0.2));border:1px solid rgba(139,92,246,0.4);color:var(--accent);margin-bottom:20px;box-shadow:0 10px 40px rgba(139,92,246,0.2);backdrop-filter:blur(10px)}
 .header h1{font-size:26px;font-weight:800;letter-spacing:-0.8px;margin-bottom:8px}
 .header h1 span{background:linear-gradient(to right,#a78bfa,#22d3ee);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .header p{color:var(--muted);font-size:14px;font-weight:500}
 .steps{display:flex;justify-content:center;gap:6px;margin:20px 0 24px;flex-wrap:wrap}
-.step-dot{
-  width:28px;height:28px;border-radius:50%;background:rgba(255,255,255,0.05);
-  border:1px solid var(--border);display:flex;align-items:center;justify-content:center;
-  font-size:11px;font-weight:800;color:var(--muted);transition:0.3s;
-}
+.step-dot{width:28px;height:28px;border-radius:50%;background:rgba(255,255,255,0.05);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;color:var(--muted);transition:0.3s}
 .step-dot.done{background:var(--success);border-color:var(--success);color:#fff}
 .step-dot.active{background:var(--accent);border-color:var(--accent);color:#fff;box-shadow:0 0 15px var(--accent-glow)}
 .section-title{font-size:13px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px;margin:24px 4px 16px;display:flex;align-items:center;gap:8px}
 .section-title::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,var(--border),transparent)}
-.lc-header{
-  background:linear-gradient(135deg,rgba(30,35,55,0.8),rgba(20,24,39,0.6));
-  border:1px solid var(--border);border-radius:24px;padding:32px 20px;
-  margin-bottom:20px;text-align:center;backdrop-filter:blur(12px);
-  position:relative;overflow:hidden;
-}
-.lc-header::before{content:'';position:absolute;top:0;left:0;width:100%;height:2px;
-  background:linear-gradient(90deg,transparent,var(--accent),transparent)}
-.lc-icon{
-  display:inline-flex;align-items:center;justify-content:center;width:64px;height:64px;
-  border-radius:20px;background:rgba(139,92,246,0.15);color:var(--accent);
-  margin-bottom:16px;border:1px solid rgba(139,92,246,0.3);
-}
+.lc-header{background:linear-gradient(135deg,rgba(30,35,55,0.8),rgba(20,24,39,0.6));border:1px solid var(--border);border-radius:24px;padding:32px 20px;margin-bottom:20px;text-align:center;backdrop-filter:blur(12px);position:relative;overflow:hidden}
+.lc-header::before{content:'';position:absolute;top:0;left:0;width:100%;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent)}
+.lc-icon{display:inline-flex;align-items:center;justify-content:center;width:64px;height:64px;border-radius:20px;background:rgba(139,92,246,0.15);color:var(--accent);margin-bottom:16px;border:1px solid rgba(139,92,246,0.3)}
 .lc-header h2{font-size:22px;font-weight:800;margin-bottom:8px;letter-spacing:-0.5px}
 .lc-header p{font-size:13px;color:var(--muted);font-weight:500}
 .panel{background:var(--card);border:1px solid var(--border);border-radius:24px;padding:24px 20px;backdrop-filter:blur(12px)}
@@ -1269,59 +1482,34 @@ body>*{position:relative;z-index:1}
 .panel input{width:100%;background:rgba(0,0,0,0.3);border:1px solid var(--border);border-radius:14px;padding:16px;color:var(--text);font-size:15px;font-weight:500;outline:none;transition:0.3s;margin-bottom:20px;font-family:inherit}
 .panel input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(139,92,246,0.15);background:rgba(0,0,0,0.5)}
 .panel input::placeholder{color:rgba(148,163,184,0.5)}
-.btn{
-  width:100%;padding:16px;border:none;border-radius:14px;font-size:16px;font-weight:700;
-  cursor:pointer;transition:0.2s;display:flex;align-items:center;justify-content:center;
-  gap:8px;color:#fff;background:linear-gradient(135deg,#8b5cf6,#6366f1);
-  box-shadow:0 8px 24px var(--accent-glow);font-family:inherit;
-}
+.btn{width:100%;padding:16px;border:none;border-radius:14px;font-size:16px;font-weight:700;cursor:pointer;transition:0.2s;display:flex;align-items:center;justify-content:center;gap:8px;color:#fff;background:linear-gradient(135deg,#8b5cf6,#6366f1);box-shadow:0 8px 24px var(--accent-glow);font-family:inherit}
 .btn:active{transform:scale(0.97);box-shadow:none}
 .btn:disabled{opacity:0.6;pointer-events:none}
 .btn-ghost{background:rgba(255,255,255,0.05);border:1px solid var(--border);box-shadow:none}
-.btn-sm{padding:10px;font-size:13px}
+.btn-danger{background:linear-gradient(135deg,#ef4444,#dc2626);box-shadow:0 8px 24px rgba(239,68,68,0.4)}
+.btn-success{background:linear-gradient(135deg,#10b981,#059669);box-shadow:0 8px 24px rgba(16,185,129,0.4)}
 .alert{padding:14px 16px;border-radius:12px;font-size:13px;font-weight:600;margin-bottom:16px;display:none;line-height:1.5}
 .alert.show{display:block}
 .alert-err{background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#fca5a5}
 .alert-ok{background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7}
-.alert-info{background:rgba(6,182,212,0.15);border:1px solid rgba(6,182,212,0.3);color:#67e8f9}
-.code-box{
-  background:rgba(0,0,0,0.3);border:1px solid rgba(16,185,129,0.3);
-  border-radius:12px;padding:14px 16px;margin-bottom:12px;
-  display:flex;justify-content:space-between;align-items:center;gap:12px;
-}
+.code-box{background:rgba(0,0,0,0.3);border:1px solid rgba(16,185,129,0.3);border-radius:12px;padding:14px 16px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;gap:12px}
 .code-box .code-content{flex:1;min-width:0}
-.code-box .code-main{
-  font-family:'Courier New',monospace;font-size:16px;color:#34d399;
-  font-weight:800;letter-spacing:1.5px;word-break:break-all;
-}
-.code-box .code-meta{font-size:11px;color:var(--muted);margin-top:4px;font-family:'Plus Jakarta Sans',sans-serif;letter-spacing:0;font-weight:600}
-.code-badge{
-  display:inline-block;padding:2px 8px;border-radius:6px;
-  font-size:9px;font-weight:800;margin-left:6px;
-  letter-spacing:0.5px;vertical-align:middle;
-}
+.code-box .code-main{font-family:'Courier New',monospace;font-size:16px;color:#34d399;font-weight:800;letter-spacing:1.5px;word-break:break-all}
+.code-box .code-meta{font-size:11px;color:var(--muted);margin-top:4px;letter-spacing:0;font-weight:600}
+.code-badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:9px;font-weight:800;margin-left:6px;letter-spacing:0.5px;vertical-align:middle}
 .code-badge.new{background:rgba(16,185,129,0.2);color:var(--success)}
 .code-badge.seen{background:rgba(148,163,184,0.2);color:var(--muted)}
 .copy-btn{background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.3);color:#34d399;padding:8px 12px;border-radius:8px;cursor:pointer;font-weight:700;font-size:11px;transition:0.2s;font-family:inherit;flex-shrink:0}
 .copy-btn:active{background:#10b981;color:#000}
-.info-card{
-  background:linear-gradient(135deg,rgba(139,92,246,0.1),rgba(6,182,212,0.05));
-  border:1px solid rgba(139,92,246,0.3);border-radius:20px;
-  padding:20px;margin-bottom:16px;
-}
+.info-card{background:linear-gradient(135deg,rgba(139,92,246,0.1),rgba(6,182,212,0.05));border:1px solid rgba(139,92,246,0.3);border-radius:20px;padding:20px;margin-bottom:16px}
 .info-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);gap:10px}
 .info-row:last-child{border-bottom:none;padding-bottom:0}
 .info-row:first-child{padding-top:0}
 .info-label{color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.8px;flex-shrink:0}
 .info-value{font-size:14px;font-weight:800;text-align:right;word-break:break-all}
-
-/* Token cards */
 .token-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}
 @media(max-width:420px){.token-grid{grid-template-columns:1fr}}
-.token-card{
-  background:var(--card);border:1px solid var(--border);
-  border-radius:16px;padding:16px;
-}
+.token-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px}
 .token-card.ok{border-color:rgba(16,185,129,0.4)}
 .token-card.err{border-color:rgba(239,68,68,0.4)}
 .token-label{font-size:10px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
@@ -1329,52 +1517,51 @@ body>*{position:relative;z-index:1}
 .token-status.ok{color:var(--success)}
 .token-status.err{color:var(--danger)}
 .token-status.pending{color:var(--muted)}
-.token-card button{
-  width:100%;padding:8px;font-size:11px;margin-top:6px;
-  background:rgba(139,92,246,0.15);border:1px solid rgba(139,92,246,0.3);
-  color:var(--accent);border-radius:8px;font-weight:700;cursor:pointer;
-  font-family:inherit;transition:0.2s;
-}
+.token-card button{width:100%;padding:8px;font-size:11px;margin-top:6px;background:rgba(139,92,246,0.15);border:1px solid rgba(139,92,246,0.3);color:var(--accent);border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;transition:0.2s}
 .token-card button:hover{background:rgba(139,92,246,0.25)}
 .token-card button:active{transform:scale(0.97)}
-
-/* Stats grid */
 .stats-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:20px}
 .stat-box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px}
 .stat-box .stat-lbl{font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:4px}
 .stat-box .stat-val{font-size:17px;font-weight:800;color:var(--text)}
 .stat-box .stat-val.ok{color:var(--success)}
 .stat-box .stat-val.err{color:var(--danger)}
-
-/* Actions */
 .code-actions{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
-.code-actions button{
-  flex:1;min-width:100px;padding:10px;
-  background:rgba(255,255,255,0.05);border:1px solid var(--border);
-  color:var(--text);border-radius:10px;font-size:12px;font-weight:700;
-  cursor:pointer;font-family:inherit;transition:0.2s;
-}
+.code-actions button{flex:1;min-width:100px;padding:10px;background:rgba(255,255,255,0.05);border:1px solid var(--border);color:var(--text);border-radius:10px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;transition:0.2s}
 .code-actions button:hover{background:rgba(255,255,255,0.1)}
 .code-actions button:active{transform:scale(0.97)}
 .code-actions button.primary{background:linear-gradient(135deg,#8b5cf6,#6366f1);border-color:transparent;box-shadow:0 4px 12px var(--accent-glow)}
-
-/* API Log viewer */
-.api-log{
-  max-height:400px;overflow-y:auto;
-  font-family:'Courier New',monospace;font-size:11px;
-  background:rgba(0,0,0,0.5);border-radius:12px;
-  padding:12px;line-height:1.7;
-}
+.api-log{max-height:400px;overflow-y:auto;font-family:'Courier New',monospace;font-size:11px;background:rgba(0,0,0,0.5);border-radius:12px;padding:12px;line-height:1.7}
 .api-log .log-entry{margin-bottom:6px;word-break:break-word;padding-bottom:4px;border-bottom:1px dashed rgba(255,255,255,0.04)}
 .api-log .log-entry:last-child{border-bottom:none}
-.log-info{color:#67e8f9}
-.log-success{color:#34d399}
-.log-warning{color:#fbbf24}
-.log-error{color:#f87171}
-.log-request{color:#a78bfa}
-.log-response{color:#94a3b8}
+.log-info{color:#67e8f9}.log-success{color:#34d399}.log-warning{color:#fbbf24}
+.log-error{color:#f87171}.log-request{color:#a78bfa}.log-response{color:#94a3b8}
 .log-time{color:#64748b;margin-right:6px}
 .log-tag{font-weight:800;margin-right:6px}
+
+/* AUTO-REDEEM section */
+.auto-section{border:1px solid rgba(6,182,212,0.3);background:linear-gradient(135deg,rgba(6,182,212,0.08),rgba(139,92,246,0.05));border-radius:20px;padding:16px;margin-bottom:16px}
+.auto-toggle-row{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px}
+.auto-info{flex:1;min-width:0}
+.auto-title{font-size:13px;font-weight:800;color:var(--text);margin-bottom:4px}
+.auto-status{font-size:11px;color:var(--muted);font-weight:600}
+.auto-btn{flex-shrink:0;padding:10px 20px;font-size:12px;font-weight:800;border-radius:10px;cursor:pointer;font-family:inherit;transition:0.2s;border:none}
+.auto-btn[data-state="on"]{background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff;box-shadow:0 4px 12px rgba(239,68,68,0.3)}
+.auto-btn[data-state="off"]{background:linear-gradient(135deg,#10b981,#059669);color:#fff;box-shadow:0 4px 12px rgba(16,185,129,0.3)}
+
+/* Manual redeem */
+.manual-panel{background:linear-gradient(135deg,rgba(245,158,11,0.08),rgba(239,68,68,0.05));border:1px solid rgba(245,158,11,0.3);border-radius:20px;padding:16px;margin-bottom:16px}
+.manual-panel input{margin-bottom:10px;padding:14px}
+.manual-panel button{padding:14px;font-size:15px}
+
+/* Auto log */
+.auto-log{max-height:240px;overflow-y:auto;font-size:12px;line-height:1.6}
+.auto-log .event{padding:8px 10px;border-radius:8px;margin-bottom:6px;border-left:3px solid transparent}
+.auto-log .event.success{background:rgba(16,185,129,0.08);border-left-color:#10b981}
+.auto-log .event.fail{background:rgba(239,68,68,0.08);border-left-color:#ef4444}
+.auto-log .event.skipped{background:rgba(148,163,184,0.08);border-left-color:#94a3b8}
+.auto-log .event .ev-code{font-family:'Courier New',monospace;font-weight:800;color:#34d399;font-size:13px}
+.auto-log .event .ev-meta{color:var(--muted);font-size:10px;margin-top:2px}
 
 .footer{text-align:center;color:var(--muted);font-size:12px;margin-top:40px;font-weight:500}
 .footer a{color:var(--accent2);text-decoration:none}
@@ -1387,20 +1574,18 @@ body>*{position:relative;z-index:1}
   <div class="header">
     <div class="logo"><svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
     <h1>Auto Tool <span>VIP</span></h1>
-    <p>Lấy code LC79 tự động — Không cần cài app</p>
+    <p>Lấy & nhập code LC79 tự động</p>
   </div>
   <div class="panel" style="text-align:center">
     <div style="padding:20px 0">
       <div style="font-size:52px;margin-bottom:16px">🎮</div>
       <div style="font-size:16px;font-weight:700;margin-bottom:8px">Tool Auto LC79</div>
       <div style="font-size:13px;color:var(--muted);margin-bottom:24px;line-height:1.6">
-        Đăng nhập Telegram → Đăng nhập game → Nhận 10 code mới nhất, Access Token & JWT
+        Đăng nhập Telegram → Đăng nhập game → Nhận code, nhập code siêu nhanh<br>
+        <strong style="color:var(--accent2)">⚡ Auto-watch: fire code trong ~0.1-0.3s</strong>
       </div>
     </div>
-    <button class="btn" onclick="startFlow()">
-      🚀 Bắt Đầu
-      <svg class="icon icon-sm" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
-    </button>
+    <button class="btn" onclick="startFlow()">🚀 Bắt Đầu</button>
   </div>
   <div class="footer">Powered by <a href="/alive" target="_blank">Auto Tool Server</a></div>
 </div>
@@ -1430,9 +1615,7 @@ body>*{position:relative;z-index:1}
 <div id="view-otp" class="view">
   <button class="btn btn-ghost" style="margin-bottom:16px;padding:10px" onclick="restart()">← Làm lại</button>
   <div class="lc-header">
-    <div class="lc-icon" style="color:var(--accent2);background:rgba(6,182,212,0.1);border-color:rgba(6,182,212,0.3)">
-      <svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
-    </div>
+    <div class="lc-icon" style="color:var(--accent2);background:rgba(6,182,212,0.1);border-color:rgba(6,182,212,0.3)"><svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg></div>
     <h2>Nhập Mã OTP</h2>
     <p>Kiểm tra Telegram để lấy mã</p>
   </div>
@@ -1442,9 +1625,6 @@ body>*{position:relative;z-index:1}
     <label>Mã OTP</label>
     <input type="text" id="otpCode" placeholder="VD: 12345" inputmode="numeric" autocomplete="one-time-code" maxlength="7">
     <button class="btn" id="btn-verify-otp" onclick="verifyOTP()">Xác Nhận OTP</button>
-    <div style="margin-top:12px;text-align:center;font-size:12px;color:var(--muted)">
-      Không nhận được mã? <a href="#" onclick="restart();return false" style="color:var(--accent2)">Gửi lại</a>
-    </div>
   </div>
 </div>
 
@@ -1452,9 +1632,7 @@ body>*{position:relative;z-index:1}
 <div id="view-2fa" class="view">
   <button class="btn btn-ghost" style="margin-bottom:16px;padding:10px" onclick="restart()">← Làm lại</button>
   <div class="lc-header" style="border-color:rgba(239,68,68,0.3)">
-    <div class="lc-icon" style="color:var(--danger);background:rgba(239,68,68,0.1);border-color:rgba(239,68,68,0.3)">
-      <svg class="icon icon-lg" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-    </div>
+    <div class="lc-icon" style="color:var(--danger);background:rgba(239,68,68,0.1);border-color:rgba(239,68,68,0.3)"><svg class="icon icon-lg" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
     <h2>Xác Thực 2 Lớp</h2>
     <p>Tài khoản được bảo vệ bằng 2FA</p>
   </div>
@@ -1471,9 +1649,7 @@ body>*{position:relative;z-index:1}
 <div id="view-game" class="view">
   <button class="btn btn-ghost" style="margin-bottom:16px;padding:10px" onclick="restart()">← Làm lại</button>
   <div class="lc-header" style="border-color:rgba(6,182,212,0.3)">
-    <div class="lc-icon" style="color:var(--accent2);background:rgba(6,182,212,0.1);border-color:rgba(6,182,212,0.3)">
-      <svg class="icon icon-lg" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 12h4m-2-2v4"/></svg>
-    </div>
+    <div class="lc-icon" style="color:var(--accent2);background:rgba(6,182,212,0.1);border-color:rgba(6,182,212,0.3)"><svg class="icon icon-lg" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 12h4m-2-2v4"/></svg></div>
     <h2>Đăng Nhập Game LC79</h2>
     <p>Xem số dư + nhận code + token</p>
   </div>
@@ -1488,14 +1664,12 @@ body>*{position:relative;z-index:1}
   </div>
 </div>
 
-<!-- STEP 5: DASHBOARD / RESULT -->
+<!-- STEP 5: DASHBOARD -->
 <div id="view-result" class="view">
   <div class="lc-header" style="border-color:rgba(16,185,129,0.3)">
-    <div class="lc-icon" style="color:var(--success);background:rgba(16,185,129,0.1);border-color:rgba(16,185,129,0.3)">
-      <svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-    </div>
+    <div class="lc-icon" style="color:var(--success);background:rgba(16,185,129,0.1);border-color:rgba(16,185,129,0.3)"><svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></div>
     <h2>Dashboard</h2>
-    <p>Tài khoản game & Token Manager</p>
+    <p>Tài khoản, Token & Redeem Engine</p>
   </div>
 
   <!-- Account info -->
@@ -1522,6 +1696,37 @@ body>*{position:relative;z-index:1}
     </div>
   </div>
 
+  <!-- ⚡ AUTO REDEEM -->
+  <div class="section-title">⚡ Auto Get & Redeem</div>
+  <div class="auto-section">
+    <div class="auto-toggle-row">
+      <div class="auto-info">
+        <div class="auto-title">Auto Watch + Redeem</div>
+        <div class="auto-status" id="auto-status">⚪ Chưa bật</div>
+      </div>
+      <button class="auto-btn" id="btn-auto-toggle" data-state="off" onclick="toggleAuto()">BẬT</button>
+    </div>
+    <div style="font-size:11px;color:var(--muted);line-height:1.6">
+      📡 Lắng nghe kênh LC79 realtime → fire redeem ngay khi có tin mới. JWT tự động refresh nền. Cần GET JWT trước khi bật.
+    </div>
+  </div>
+
+  <!-- 🎯 MANUAL REDEEM -->
+  <div class="section-title">🎯 Nhập Code Thủ Công</div>
+  <div class="manual-panel">
+    <input type="text" id="manualCode" placeholder="VD: DVANXYZGE hoặc LC79DVANXYZGE" autocomplete="off" style="text-transform:uppercase">
+    <input type="text" id="manualCaptcha" placeholder="Captcha (để trống nếu không có)" autocomplete="off">
+    <button class="btn btn-success" id="btn-manual-redeem" onclick="redeemManual()">⚡ NHẬP NGAY</button>
+  </div>
+
+  <!-- Auto redeem log -->
+  <div class="section-title">Auto Redeem Log</div>
+  <div class="panel" id="auto-events-panel" style="padding:10px">
+    <div class="auto-log" id="auto-events">
+      <div style="color:var(--muted);text-align:center;padding:12px">Chưa có hoạt động</div>
+    </div>
+  </div>
+
   <!-- Stats -->
   <div class="section-title">API Statistics</div>
   <div class="stats-grid">
@@ -1531,7 +1736,7 @@ body>*{position:relative;z-index:1}
     <div class="stat-box"><div class="stat-lbl">Avg Time</div><div class="stat-val" id="stat-avg">0 ms</div></div>
   </div>
 
-  <!-- Giftcodes -->
+  <!-- Giftcodes list -->
   <div class="section-title">Giftcode LC79</div>
   <div class="code-actions">
     <button onclick="fetchCodes()" class="primary">🔄 REFRESH CODE</button>
@@ -1559,16 +1764,10 @@ body>*{position:relative;z-index:1}
 
 <script>
 let state = {
-  session_id: '',
-  gameUser: '',
-  gameBalance: 0,
-  gameXu: 0,
-  loginTime: 0,
-  codes: [],
-  logVisible: false,
-  atReady: false,
-  jwtReady: false,
-  jwtExp: 0,
+  session_id: '', gameUser: '', gameBalance: 0, gameXu: 0,
+  loginTime: 0, codes: [], logVisible: false,
+  atReady: false, jwtReady: false, jwtExp: 0,
+  autoEnabled: false,
 };
 
 function showView(id) {
@@ -1599,47 +1798,28 @@ function hideAlert(id) {
   if (el) el.classList.remove('show');
 }
 
-function startFlow() {
-  state.session_id = '';
-  showView('view-api');
-  updateSteps('steps1', 1);
-}
-function restart() {
-  state.session_id = '';
-  showView('view-home');
-}
+function startFlow() { state.session_id = ''; showView('view-api'); updateSteps('steps1', 1); }
+function restart() { state.session_id = ''; showView('view-home'); }
 
 async function sendOTP() {
   const api_id = document.getElementById('apiId').value.trim();
   const api_hash = document.getElementById('apiHash').value.trim();
   const phone = document.getElementById('phone').value.trim();
   hideAlert('alert-api');
-  if (!api_id || !api_hash || !phone) {
-    showAlert('alert-api', 'Vui lòng nhập đầy đủ thông tin!');
-    return;
-  }
+  if (!api_id || !api_hash || !phone) { showAlert('alert-api', 'Vui lòng nhập đầy đủ thông tin!'); return; }
   const btn = document.getElementById('btn-send-otp');
   btn.innerText = 'Đang gửi OTP...'; btn.disabled = true;
   try {
-    const res = await fetch('/api/send_code', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({api_id, api_hash, phone})
-    });
+    const res = await fetch('/api/send_code', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({api_id, api_hash, phone})});
     const data = await res.json();
     if (data.status === 'ok') {
       state.session_id = data.session_id;
-      showView('view-otp');
-      updateSteps('steps2', 2);
+      showView('view-otp'); updateSteps('steps2', 2);
       document.getElementById('otpCode').value = '';
       document.getElementById('otpCode').focus();
-    } else {
-      showAlert('alert-api', data.message);
-    }
-  } catch (e) {
-    showAlert('alert-api', 'Lỗi kết nối server!');
-  } finally {
-    btn.innerText = 'Gửi OTP →'; btn.disabled = false;
-  }
+    } else { showAlert('alert-api', data.message); }
+  } catch (e) { showAlert('alert-api', 'Lỗi kết nối server!'); }
+  finally { btn.innerText = 'Gửi OTP →'; btn.disabled = false; }
 }
 
 async function verifyOTP() {
@@ -1649,27 +1829,16 @@ async function verifyOTP() {
   const btn = document.getElementById('btn-verify-otp');
   btn.innerText = 'Đang xác thực...'; btn.disabled = true;
   try {
-    const res = await fetch('/api/verify_code', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({session_id: state.session_id, code})
-    });
+    const res = await fetch('/api/verify_code', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session_id: state.session_id, code})});
     const data = await res.json();
-    if (data.status === 'ok') {
-      showView('view-game');
-      updateSteps('steps4', 4);
-    } else if (data.status === '2fa') {
-      showView('view-2fa');
-      updateSteps('steps3', 3);
+    if (data.status === 'ok') { showView('view-game'); updateSteps('steps4', 4); }
+    else if (data.status === '2fa') {
+      showView('view-2fa'); updateSteps('steps3', 3);
       document.getElementById('password2fa').value = '';
       document.getElementById('password2fa').focus();
-    } else {
-      showAlert('alert-otp', data.message);
-    }
-  } catch (e) {
-    showAlert('alert-otp', 'Lỗi kết nối server!');
-  } finally {
-    btn.innerText = 'Xác Nhận OTP'; btn.disabled = false;
-  }
+    } else { showAlert('alert-otp', data.message); }
+  } catch (e) { showAlert('alert-otp', 'Lỗi kết nối server!'); }
+  finally { btn.innerText = 'Xác Nhận OTP'; btn.disabled = false; }
 }
 
 async function verify2FA() {
@@ -1679,60 +1848,37 @@ async function verify2FA() {
   const btn = document.getElementById('btn-verify-2fa');
   btn.innerText = 'Đang xác thực...'; btn.disabled = true;
   try {
-    const res = await fetch('/api/verify_2fa', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({session_id: state.session_id, password})
-    });
+    const res = await fetch('/api/verify_2fa', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session_id: state.session_id, password})});
     const data = await res.json();
-    if (data.status === 'ok') {
-      showView('view-game');
-      updateSteps('steps4', 4);
-    } else {
-      showAlert('alert-2fa', data.message);
-    }
-  } catch (e) {
-    showAlert('alert-2fa', 'Lỗi kết nối server!');
-  } finally {
-    btn.innerText = 'Xác Nhận'; btn.disabled = false;
-  }
+    if (data.status === 'ok') { showView('view-game'); updateSteps('steps4', 4); }
+    else { showAlert('alert-2fa', data.message); }
+  } catch (e) { showAlert('alert-2fa', 'Lỗi kết nối server!'); }
+  finally { btn.innerText = 'Xác Nhận'; btn.disabled = false; }
 }
 
 async function gameLogin() {
   const username = document.getElementById('gameUser').value.trim();
   const password = document.getElementById('gamePass').value;
   hideAlert('alert-game');
-  if (!username || !password) {
-    showAlert('alert-game', 'Vui lòng nhập đủ Username và Mật khẩu game!');
-    return;
-  }
+  if (!username || !password) { showAlert('alert-game', 'Vui lòng nhập đủ Username và Mật khẩu game!'); return; }
   const btn = document.getElementById('btn-game-login');
   btn.innerText = 'Đang đăng nhập...'; btn.disabled = true;
   try {
-    const res = await fetch('/api/login_game', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({username, password, session_id: state.session_id})
-    });
+    const res = await fetch('/api/login_game', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username, password, session_id: state.session_id})});
     const data = await res.json();
     if (data.status === 'ok') {
-      state.gameUser = data.username;
-      state.gameBalance = data.balance;
-      state.gameXu = data.xuTotal;
+      state.gameUser = data.username; state.gameBalance = data.balance; state.gameXu = data.xuTotal;
       state.loginTime = data.login_time || (Date.now() / 1000);
       state.atReady = !!data.access_token_ready;
-      // Move to dashboard
       showView('view-result');
       renderAccountInfo();
       updateTokenStatusFromState();
       await fetchCodes();
       await refreshStats();
-    } else {
-      showAlert('alert-game', data.message);
-    }
-  } catch (e) {
-    showAlert('alert-game', 'Lỗi kết nối server!');
-  } finally {
-    btn.innerText = 'Đăng Nhập →'; btn.disabled = false;
-  }
+      await refreshAutoEvents();
+    } else { showAlert('alert-game', data.message); }
+  } catch (e) { showAlert('alert-game', 'Lỗi kết nối server!'); }
+  finally { btn.innerText = 'Đăng Nhập →'; btn.disabled = false; }
 }
 
 function renderAccountInfo() {
@@ -1740,8 +1886,7 @@ function renderAccountInfo() {
   document.getElementById('info-balance').textContent = Number(state.gameBalance||0).toLocaleString('vi-VN');
   document.getElementById('info-xu').textContent = Number(state.gameXu||0).toLocaleString('vi-VN');
   if (state.loginTime) {
-    document.getElementById('info-login-time').textContent =
-      new Date(state.loginTime * 1000).toLocaleString('vi-VN');
+    document.getElementById('info-login-time').textContent = new Date(state.loginTime * 1000).toLocaleString('vi-VN');
   }
 }
 
@@ -1757,14 +1902,12 @@ function updateTokenStatusFromState() {
     atStatus.className = 'token-status pending';
     atStatus.textContent = '⚠ Chưa lấy — bấm GET TOKEN';
   }
-
   const jwtCard = document.getElementById('token-card-jwt');
   const jwtStatus = document.getElementById('jwt-status');
   if (state.jwtReady && state.jwtExp > 0) {
     const remain = Math.max(0, Math.floor((state.jwtExp - Date.now()/1000) / 60));
     if (remain > 0) {
-      jwtCard.classList.add('ok');
-      jwtCard.classList.remove('err');
+      jwtCard.classList.add('ok'); jwtCard.classList.remove('err');
       jwtStatus.className = 'token-status ok';
       jwtStatus.textContent = `✅ Hợp lệ (còn ~${remain} phút)`;
       return;
@@ -1779,24 +1922,14 @@ async function fetchAccessToken() {
   const btn = document.getElementById('btn-get-at');
   btn.textContent = 'Đang lấy...'; btn.disabled = true;
   try {
-    const res = await fetch('/api/get_access_token', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({session_id: state.session_id})
-    });
+    const res = await fetch('/api/get_access_token', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session_id: state.session_id})});
     const data = await res.json();
-    if (data.status === 'ok') {
-      state.atReady = true;
-      toast('Đã lấy Access Token ✓');
-    } else {
-      toast('Lỗi: ' + data.message);
-    }
+    if (data.status === 'ok') { state.atReady = true; toast('Đã lấy Access Token ✓'); }
+    else { toast('Lỗi: ' + data.message); }
     updateTokenStatusFromState();
     await refreshStats();
-  } catch (e) {
-    toast('Lỗi kết nối server!');
-  } finally {
-    btn.textContent = 'GET TOKEN'; btn.disabled = false;
-  }
+  } catch (e) { toast('Lỗi kết nối server!'); }
+  finally { btn.textContent = 'GET TOKEN'; btn.disabled = false; }
 }
 
 async function fetchJWT(force) {
@@ -1804,26 +1937,17 @@ async function fetchJWT(force) {
   btn.textContent = 'Đang xử lý...'; btn.disabled = true;
   try {
     const endpoint = force ? '/api/refresh_jwt' : '/api/get_jwt';
-    const res = await fetch(endpoint, {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({session_id: state.session_id, force})
-    });
+    const res = await fetch(endpoint, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session_id: state.session_id, force})});
     const data = await res.json();
     if (data.status === 'ok') {
-      state.jwtReady = true;
-      state.jwtExp = data.exp || 0;
-      state.atReady = true;  // refresh_jwt cũng lấy lại AT
+      state.jwtReady = true; state.jwtExp = data.exp || 0;
+      state.atReady = true;
       toast('Đã có JWT' + (data.has_exp ? ` (còn ~${data.expires_in_minutes} phút)` : ' (không có exp)'));
-    } else {
-      toast('Lỗi: ' + data.message);
-    }
+    } else { toast('Lỗi: ' + data.message); }
     updateTokenStatusFromState();
     await refreshStats();
-  } catch (e) {
-    toast('Lỗi kết nối server!');
-  } finally {
-    btn.textContent = force ? 'REFRESH' : 'GET JWT'; btn.disabled = false;
-  }
+  } catch (e) { toast('Lỗi kết nối server!'); }
+  finally { btn.textContent = force ? 'REFRESH' : 'GET JWT'; btn.disabled = false; }
 }
 
 async function refreshStats() {
@@ -1840,14 +1964,127 @@ async function refreshStats() {
   } catch (e) {}
 }
 
+/* ============ MANUAL REDEEM ============ */
+async function redeemManual() {
+  const code = document.getElementById('manualCode').value.trim();
+  const captcha = document.getElementById('manualCaptcha').value.trim();
+  if (!code) { toast('Nhập code trước'); return; }
+  const btn = document.getElementById('btn-manual-redeem');
+  btn.disabled = true; btn.textContent = '⚡ Đang bắn...';
+  const t0 = performance.now();
+  try {
+    const res = await fetch('/api/redeem_manual', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({session_id: state.session_id, code, captcha})
+    });
+    const data = await res.json();
+    const ms = Math.round(performance.now() - t0);
+    if (data.http === 200 || data.http === 201) {
+      const amt = data.amount || (data.body && (data.body.money || data.body.amount));
+      toast(amt ? `✅ +${Number(amt).toLocaleString('vi-VN')} (${ms}ms)` : `✅ Nhập thành công (${ms}ms)`);
+      document.getElementById('manualCode').value = '';
+    } else {
+      const msg = (data.body && data.body.message) || data.message || `HTTP ${data.http}`;
+      toast(`❌ ${msg} (${ms}ms)`);
+    }
+    await refreshAutoEvents();
+    await refreshStats();
+  } catch (e) {
+    toast('Lỗi kết nối server');
+  } finally {
+    btn.disabled = false; btn.textContent = '⚡ NHẬP NGAY';
+  }
+}
+
+/* ============ AUTO WATCH ============ */
+async function toggleAuto() {
+  const btn = document.getElementById('btn-auto-toggle');
+  const isOn = btn.dataset.state === 'on';
+  btn.disabled = true; btn.textContent = '...';
+  try {
+    const res = await fetch('/api/toggle_auto', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({session_id: state.session_id, enabled: !isOn})
+    });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      setAutoState(!isOn);
+      toast(!isOn ? '🎯 Đã bật Auto Watch — sẽ fire code khi có tin mới' : '🛑 Đã tắt Auto Watch');
+    } else {
+      toast('Lỗi: ' + (data.message || 'unknown'));
+    }
+  } catch (e) {
+    toast('Lỗi kết nối server');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function setAutoState(on) {
+  const btn = document.getElementById('btn-auto-toggle');
+  state.autoEnabled = on;
+  btn.dataset.state = on ? 'on' : 'off';
+  btn.textContent = on ? 'TẮT' : 'BẬT';
+  document.getElementById('auto-status').textContent = on ? '🟢 Đang theo dõi realtime' : '⚪ Chưa bật';
+}
+
+async function refreshAutoEvents() {
+  if (!state.session_id) return;
+  try {
+    const res = await fetch('/api/auto_status', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({session_id: state.session_id})
+    });
+    const data = await res.json();
+    if (data.status !== 'ok') return;
+    if (data.enabled !== state.autoEnabled) setAutoState(!!data.enabled);
+    if (data.jwt_remaining_minutes > 0) {
+      state.jwtReady = true;
+      state.jwtExp = Date.now()/1000 + data.jwt_remaining_minutes * 60;
+      updateTokenStatusFromState();
+    }
+    const container = document.getElementById('auto-events');
+    if (!data.events || data.events.length === 0) {
+      container.innerHTML = '<div style="color:var(--muted);text-align:center;padding:12px">Chưa có hoạt động</div>';
+      return;
+    }
+    container.innerHTML = '';
+    const events = data.events.slice().reverse();
+    events.forEach(e => {
+      const time = new Date(e.ts * 1000).toLocaleTimeString('vi-VN');
+      const isSuccess = e.status === 'success';
+      const isSkipped = e.status === 'skipped';
+      const cls = isSuccess ? 'success' : isSkipped ? 'skipped' : 'fail';
+      const icon = isSuccess ? '✅' : isSkipped ? '⏸' : '❌';
+      const amtStr = e.amount ? ` <strong style="color:var(--success)">+${Number(e.amount).toLocaleString('vi-VN')}</strong>` : '';
+      const candStr = e.candidates && e.candidates.length > 1
+        ? ` <span style="color:var(--warning)">[${e.candidates.length} fmt]</span>` : '';
+      const timing = [];
+      if (e.delay_ms !== undefined) timing.push(`fire +${e.delay_ms}ms`);
+      if (e.elapsed_ms !== undefined) timing.push(`HTTP ${e.elapsed_ms}ms`);
+      if (e.total_ms !== undefined) timing.push(`total ${e.total_ms}ms`);
+      const div = document.createElement('div');
+      div.className = 'event ' + cls;
+      div.innerHTML = `
+        <div><span class="ev-code">${e.code}</span>${amtStr}${candStr}</div>
+        <div class="ev-meta">
+          ${icon} ${time} · HTTP ${e.http || '-'} ${e.manual ? '· MANUAL' : '· AUTO'}
+          ${timing.length ? ' · ' + timing.join(' · ') : ''}
+          ${e.message ? '<br>' + e.message : ''}
+        </div>
+      `;
+      container.appendChild(container.firstChild ? div : div);
+    });
+    const ordered = Array.from(container.querySelectorAll('.event'));
+    // Already appended in reversed order; keep as-is
+  } catch (e) {}
+}
+
 async function fetchCodes() {
   const container = document.getElementById('codes-container');
   container.innerHTML = '<div style="text-align:center;color:var(--muted);padding:20px">Đang quét kênh LC79...</div>';
   try {
-    const res = await fetch('/api/get_codes', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({session_id: state.session_id})
-    });
+    const res = await fetch('/api/get_codes', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session_id: state.session_id})});
     const data = await res.json();
     if (data.status === 'ok' && data.items && data.items.length > 0) {
       state.codes = data.items.map(it => it.code);
@@ -1872,7 +2109,7 @@ async function fetchCodes() {
         `;
         container.appendChild(div);
       });
-    } else if (data.status === 'ok' && (!data.items || data.items.length === 0)) {
+    } else if (data.status === 'ok') {
       container.innerHTML = '<div style="text-align:center;color:var(--muted);padding:20px">Không tìm thấy code.</div>';
       state.codes = [];
     } else {
@@ -1885,17 +2122,11 @@ async function fetchCodes() {
   await refreshStats();
 }
 
-function copyCode(text) {
-  navigator.clipboard.writeText(text).then(() => toast('Đã copy: ' + text));
-}
+function copyCode(text) { navigator.clipboard.writeText(text).then(() => toast('Đã copy: ' + text)); }
 
 function copyAllCodes() {
-  if (!state.codes || state.codes.length === 0) {
-    toast('Chưa có code để copy');
-    return;
-  }
-  const text = state.codes.join('\n');
-  navigator.clipboard.writeText(text).then(() => toast(`Đã copy ${state.codes.length} code`));
+  if (!state.codes || state.codes.length === 0) { toast('Chưa có code để copy'); return; }
+  navigator.clipboard.writeText(state.codes.join('\n')).then(() => toast(`Đã copy ${state.codes.length} code`));
 }
 
 function toast(msg) {
@@ -1903,20 +2134,13 @@ function toast(msg) {
   t.style.cssText = 'position:fixed;bottom:30px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg,#10b981,#059669);color:white;padding:12px 24px;border-radius:12px;font-size:13px;font-weight:700;z-index:9999;transition:0.3s;box-shadow:0 10px 20px rgba(16,185,129,0.3);max-width:90vw;text-align:center';
   t.innerText = msg;
   document.body.appendChild(t);
-  setTimeout(() => {
-    t.style.opacity='0';
-    t.style.transform='translateX(-50%) translateY(20px)';
-    setTimeout(()=>t.remove(),300);
-  }, 2200);
+  setTimeout(() => { t.style.opacity='0'; t.style.transform='translateX(-50%) translateY(20px)'; setTimeout(()=>t.remove(),300); }, 2200);
 }
 
 async function checkApi() {
   toast('Đang kiểm tra API...');
   try {
-    const res = await fetch('/api/check_api', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({session_id: state.session_id})
-    });
+    const res = await fetch('/api/check_api', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({})});
     const data = await res.json();
     const r = data.results || {};
     let msg = '';
@@ -1925,21 +2149,14 @@ async function checkApi() {
       msg += `${item.name}: ${item.ok ? '✅' : '❌'} ${item.http || item.error || ''}  `;
     }
     toast(msg.trim());
-    if (state.logVisible) await loadLogs();
-  } catch (e) {
-    toast('Lỗi kết nối server');
-  }
+  } catch (e) { toast('Lỗi kết nối server'); }
 }
 
 async function toggleLog() {
   state.logVisible = !state.logVisible;
   const panel = document.getElementById('api-log-panel');
-  if (state.logVisible) {
-    panel.style.display = 'block';
-    await loadLogs();
-  } else {
-    panel.style.display = 'none';
-  }
+  if (state.logVisible) { panel.style.display = 'block'; await loadLogs(); }
+  else { panel.style.display = 'none'; }
 }
 
 function renderLogEntry(e) {
@@ -1969,9 +2186,7 @@ async function loadLogs() {
     } else {
       container.innerHTML = '<div style="color:var(--muted);text-align:center;padding:12px">Chưa có log</div>';
     }
-  } catch (e) {
-    toast('Lỗi tải log');
-  }
+  } catch (e) { toast('Lỗi tải log'); }
 }
 
 async function clearLog() {
@@ -1980,13 +2195,19 @@ async function clearLog() {
     if (state.logVisible) await loadLogs();
     await refreshStats();
     toast('Đã xoá log');
-  } catch (e) {
-    toast('Lỗi xoá log');
-  }
+  } catch (e) { toast('Lỗi xoá log'); }
 }
 
 document.getElementById('otpCode')?.addEventListener('keypress', e => { if (e.key === 'Enter') verifyOTP(); });
 document.getElementById('password2fa')?.addEventListener('keypress', e => { if (e.key === 'Enter') verify2FA(); });
+document.getElementById('manualCode')?.addEventListener('keypress', e => { if (e.key === 'Enter') redeemManual(); });
+
+// Auto-poll when dashboard active
+setInterval(() => {
+  if (document.getElementById('view-result').classList.contains('active')) {
+    refreshAutoEvents();
+  }
+}, 2000);
 </script>
 </body>
 </html>
@@ -2004,42 +2225,15 @@ ALIVE_HTML = r"""<!DOCTYPE html>
 <title>Server Alive</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{
-  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-  background:#05050a;color:#f8fafc;min-height:100vh;
-  display:flex;align-items:center;justify-content:center;padding:20px;
-  background-image:
-    radial-gradient(circle at 0% 0%,rgba(139,92,246,0.15) 0%,transparent 50%),
-    radial-gradient(circle at 100% 100%,rgba(16,185,129,0.15) 0%,transparent 50%);
-  background-attachment:fixed;
-}
-.card{
-  background:rgba(20,24,39,0.6);backdrop-filter:blur(12px);
-  border:1px solid rgba(16,185,129,0.3);border-radius:24px;
-  padding:48px 40px;text-align:center;max-width:440px;width:100%;
-  box-shadow:0 20px 60px rgba(16,185,129,0.15);
-}
-.icon-wrap{
-  width:88px;height:88px;margin:0 auto 24px;border-radius:24px;
-  background:linear-gradient(135deg,rgba(16,185,129,0.2),rgba(6,182,212,0.2));
-  border:1px solid rgba(16,185,129,0.4);
-  display:flex;align-items:center;justify-content:center;font-size:44px;
-  animation:breathe 2.5s ease-in-out infinite;
-}
-@keyframes breathe{
-  0%,100%{transform:scale(1);box-shadow:0 0 30px rgba(16,185,129,0.3)}
-  50%{transform:scale(1.05);box-shadow:0 0 50px rgba(16,185,129,0.5)}
-}
-h1{font-size:28px;font-weight:800;margin-bottom:8px;
-  background:linear-gradient(to right,#34d399,#22d3ee);
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#05050a;color:#f8fafc;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background-image:radial-gradient(circle at 0% 0%,rgba(139,92,246,0.15) 0%,transparent 50%),radial-gradient(circle at 100% 100%,rgba(16,185,129,0.15) 0%,transparent 50%);background-attachment:fixed}
+.card{background:rgba(20,24,39,0.6);backdrop-filter:blur(12px);border:1px solid rgba(16,185,129,0.3);border-radius:24px;padding:48px 40px;text-align:center;max-width:440px;width:100%;box-shadow:0 20px 60px rgba(16,185,129,0.15)}
+.icon-wrap{width:88px;height:88px;margin:0 auto 24px;border-radius:24px;background:linear-gradient(135deg,rgba(16,185,129,0.2),rgba(6,182,212,0.2));border:1px solid rgba(16,185,129,0.4);display:flex;align-items:center;justify-content:center;font-size:44px;animation:breathe 2.5s ease-in-out infinite}
+@keyframes breathe{0%,100%{transform:scale(1);box-shadow:0 0 30px rgba(16,185,129,0.3)}50%{transform:scale(1.05);box-shadow:0 0 50px rgba(16,185,129,0.5)}}
+h1{font-size:28px;font-weight:800;margin-bottom:8px;background:linear-gradient(to right,#34d399,#22d3ee);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .status{display:inline-flex;align-items:center;gap:8px;color:#34d399;font-size:13px;font-weight:600;margin-bottom:24px}
-.dot{width:10px;height:10px;border-radius:50%;background:#10b981;
-  box-shadow:0 0 12px #10b981;animation:pulse 1.5s ease-in-out infinite}
+.dot{width:10px;height:10px;border-radius:50%;background:#10b981;box-shadow:0 0 12px #10b981;animation:pulse 1.5s ease-in-out infinite}
 @keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.4);opacity:.6}}
-.stat{background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.08);
-  border-radius:12px;padding:14px 18px;margin-top:12px;
-  display:flex;justify-content:space-between;align-items:center}
+.stat{background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:14px 18px;margin-top:12px;display:flex;justify-content:space-between;align-items:center}
 .stat-label{color:#94a3b8;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.8px}
 .stat-value{color:#34d399;font-size:15px;font-weight:800;font-family:'Courier New',monospace}
 .link-back{display:inline-block;margin-top:24px;color:#22d3ee;text-decoration:none;font-size:13px;font-weight:600}
@@ -2129,8 +2323,10 @@ def run_flask():
 
 # ============ MAIN ============
 if __name__ == "__main__":
+    threading.Thread(target=_warm_redeem_connection, daemon=True, name="WarmRedeem").start()
     async_manager.start()
     threading.Thread(target=cleanup_old_sessions, daemon=True, name="SessionCleanup").start()
     threading.Thread(target=keep_alive, daemon=True, name="KeepAlive").start()
+    threading.Thread(target=jwt_prewarm_loop, daemon=True, name="JwtPrewarm").start()
     logger.info(f"🚀 Web server khởi động tại port {PORT}")
     run_flask()
