@@ -5,13 +5,16 @@ import logging
 import requests
 import re
 import asyncio
+import hashlib
+import base64
+import json
 from flask import Flask, Response, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import Conflict
 
 # Telethon Imports
-from telethon import TelegramClient, functions
+from telethon import TelegramClient, events, functions
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 
@@ -29,20 +32,243 @@ logger = logging.getLogger("AutoTool")
 
 flask_app = Flask(__name__)
 
-# ================================================================
-#                    TELEGRAM API ENDPOINTS (TELETHON)
-# ================================================================
+# ============ LC79 CONSTANTS ============
+API_GET_ACCESS = "https://apifo88daigia.tele68.com/api"
+LOGIN_URL = "https://wlb.tele68.com/v1/lobby/auth/login"
+BASE_URL = "https://gameapi.tele68.com"
+PARAMS = "/v1/giftcode/redemption?cp=R&cl=R&pf=web&at="
+CONNECT_TIMEOUT = 5
+READ_TIMEOUT = 45
 
+# ============ GLOBAL STATE ============
+STATE = {
+    "codes": [], # [{"code": "XXXX", "status": "Pending", "msg": ""}]
+    "lc79_account": None,
+    "listener_running": False,
+    "user_chat_id": None # Lưu ID Telegram của User để gửi thông báo
+}
+
+# Hàm gửi thông báo trực tiếp qua Telegram API
+def notify_user(text):
+    if not STATE["user_chat_id"]:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(url, json={
+            "chat_id": STATE["user_chat_id"],
+            "text": text,
+            "parse_mode": "HTML"
+        }, timeout=5)
+    except Exception as e:
+        logger.error(f"Lỗi gửi thông báo: {e}")
+
+# ================================================================
+#                    LC79 REDEMPTION LOGIC
+# ================================================================
+class Account:
+    def __init__(self, un, pw, nick):
+        self.un = un
+        self.pw = pw
+        self.nick = nick
+        self.used_codes = set()
+        self.lock = threading.Lock()
+        self.jwt = None
+        self.jwt_exp = 0
+
+    def _headers(self, auth=None):
+        h = {
+            "content-type": "application/json",
+            "user-agent": "Mozilla/5.0",
+            "origin": "https://lc79.to",
+            "referer": "https://lc79.to/",
+            "accept": "application/json, text/plain, */*",
+            "connection": "close",
+        }
+        if auth:
+            h["authorization"] = f"Bearer {auth}"
+        return h
+
+    @staticmethod
+    def parse_jwt_exp(token):
+        try:
+            payload = token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            data = json.loads(base64.urlsafe_b64decode(payload))
+            return data.get("exp", 0)
+        except Exception:
+            return 0
+
+    def is_token_valid(self):
+        return self.jwt is not None and time.time() < (self.jwt_exp - 60)
+
+    def get_access_token(self):
+        try:
+            with requests.Session() as s:
+                res = s.get(API_GET_ACCESS, params={
+                    "c": "3", "un": self.un, "pw": self.pw,
+                    "cp": "R", "cl": "R", "pf": "web", "at": ""
+                }, headers=self._headers(), timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+            data = res.json()
+            if data.get("success"):
+                return data.get("accessToken")
+            return None
+        except Exception:
+            return None
+
+    def refresh_token(self):
+        access_token = self.get_access_token()
+        if not access_token:
+            return False
+
+        try:
+            login_headers = {
+                "content-type": "application/json",
+                "origin": "https://lc79b.bet",
+                "referer": "https://lc79b.bet/",
+                "user-agent": "Mozilla/5.0",
+                "connection": "close",
+            }
+            with requests.Session() as s:
+                res = s.post(LOGIN_URL, headers=login_headers, json={
+                    "nickName": self.nick, "accessToken": access_token
+                }, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+            data = res.json()
+            new_token = data.get("token")
+            if new_token:
+                self.jwt = new_token
+                self.jwt_exp = self.parse_jwt_exp(new_token)
+                return True
+            return False
+        except Exception:
+            return False
+
+    def redeem_code(self, code, _retry=False, _attempt=0):
+        with self.lock:
+            if code in self.used_codes:
+                return False, "Đã sử dụng"
+            self.used_codes.add(code)
+
+        if not self.is_token_valid():
+            if not self.refresh_token():
+                return False, "Lỗi Token"
+
+        try:
+            with requests.Session() as s:
+                res = s.post(
+                    BASE_URL + PARAMS,
+                    headers=self._headers(self.jwt),
+                    json={"code": code.strip(), "captcha": ""},
+                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)
+                )
+            try:
+                data = res.json()
+            except Exception:
+                data = {}
+
+            if res.status_code == 401:
+                if self.refresh_token():
+                    with self.lock:
+                        self.used_codes.discard(code)
+                    return self.redeem_code(code, _retry=True)
+                return False, "Lỗi xác thực"
+
+            if res.status_code in [200, 201]:
+                amount = data.get("money") or data.get("amount") or data.get("reward") or (data.get("data") or {}).get("money")
+                return True, f"+{int(amount):,}k" if amount else "Thành công"
+            elif res.status_code == 400:
+                msg = data.get("message") if isinstance(data, dict) else "Thất bại"
+                return False, msg
+            elif res.status_code == 428:
+                return False, "Yêu cầu CAPTCHA"
+            elif res.status_code == 429:
+                return False, "Quá giới hạn"
+            else:
+                return False, f"Lỗi {res.status_code}"
+
+        except Exception:
+            if _attempt < 2:
+                return self.redeem_code(code, _retry=_retry, _attempt=_attempt+1)
+            return False, "Lỗi mạng"
+
+def process_new_code(code):
+    for c in STATE["codes"]:
+        if c["code"] == code:
+            return
+            
+    logger.info(f"🔥 PHÁT HIỆN CODE MỚI: {code}")
+    new_item = {"code": code, "status": "Pending", "msg": "Đang chờ..."}
+    STATE["codes"].insert(0, new_item)
+    if len(STATE["codes"]) > 10:
+        STATE["codes"] = STATE["codes"][:10]
+        
+    if STATE["lc79_account"]:
+        threading.Thread(target=redeem_thread, args=(new_item, STATE["lc79_account"])).start()
+    else:
+        notify_user(f"🔔 <b>Phát hiện code mới:</b> <code>{code}</code>\nVui lòng mở Mini App và đăng nhập LC79 để tự động nhập!")
+
+def redeem_thread(item, acc):
+    item["status"] = "Processing"
+    item["msg"] = "Đang nhập..."
+    success, msg = acc.redeem_code(item["code"])
+    
+    if success:
+        item["status"] = "Success"
+        item["msg"] = msg
+        logger.info(f"✅ REDEEM THÀNH CÔNG: {item['code']} - {msg}")
+        notify_user(f"✅ <b>NHẬP CODE THÀNH CÔNG</b>\n\n🎁 Mã: <code>{item['code']}</code>\n💰 Nhận được: <b>{msg}</b>")
+    else:
+        item["status"] = "Failed"
+        item["msg"] = msg
+        logger.warning(f"❌ REDEEM THẤT BẠI: {item['code']} - {msg}")
+        notify_user(f"❌ <b>NHẬP CODE THẤT BẠI</b>\n\n🎁 Mã: <code>{item['code']}</code>\n⚠️ Lý do: {msg}")
+
+# ================================================================
+#                    TELEGRAM BACKGROUND LISTENER (SIÊU NHANH)
+# ================================================================
+def start_background_listener(session_str, api_id, api_hash):
+    if STATE["listener_running"]:
+        return
+    STATE["listener_running"] = True
+    
+    def run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        # request_retries và connection_retries cao để đảm bảo không rớt mạng
+        client = TelegramClient(StringSession(session_str), int(api_id), api_hash, loop=loop, connection_retries=None)
+        
+        async def main():
+            await client.connect()
+            try:
+                channel = await client.get_entity('codelaucuagame')
+                await client(functions.channels.JoinChannelRequest(channel=channel))
+            except Exception as e:
+                logger.warning(f"Join channel note: {e}")
+
+            # Lắng nghe tin nhắn mới với độ trễ ~0ms
+            @client.on(events.NewMessage(chats='codelaucuagame'))
+            async def handler(event):
+                text = event.raw_text or ""
+                match = re.search(r"LC79([A-Z0-9]+)", text)
+                if match:
+                    code = match.group(1)
+                    process_new_code(code)
+
+            logger.info("🚀 Background Listener đang chạy (Real-time)...")
+            await client.run_until_disconnected()
+
+        loop.run_until_complete(main())
+
+    threading.Thread(target=run, daemon=True).start()
+
+# ================================================================
+#                    API ENDPOINTS
+# ================================================================
 @flask_app.route("/api/send_code", methods=["POST"])
 def api_send_code():
     data = request.json
-    api_id = data.get("api_id")
-    api_hash = data.get("api_hash")
-    phone = data.get("phone")
-
+    api_id, api_hash, phone = data.get("api_id"), data.get("api_hash"), data.get("phone")
     if not all([api_id, api_hash, phone]):
-        return jsonify({"status": "error", "message": "Vui lòng nhập đủ thông tin."})
-
+        return jsonify({"status": "error", "message": "Thiếu thông tin."})
     async def _send():
         try:
             client = TelegramClient(StringSession(), int(api_id), api_hash)
@@ -53,396 +279,238 @@ def api_send_code():
             return {"status": "ok", "phone_code_hash": sent.phone_code_hash, "session": session_str}
         except Exception as e:
             return {"status": "error", "message": str(e)}
-
-    result = asyncio.run(_send())
-    return jsonify(result)
+    return jsonify(asyncio.run(_send()))
 
 @flask_app.route("/api/verify_code", methods=["POST"])
 def api_verify_code():
     data = request.json
-    api_id = data.get("api_id")
-    api_hash = data.get("api_hash")
-    phone = data.get("phone")
-    code = data.get("code")
-    phone_code_hash = data.get("phone_code_hash")
-    session_str = data.get("session")
-
     async def _verify():
         try:
-            client = TelegramClient(StringSession(session_str), int(api_id), api_hash)
+            client = TelegramClient(StringSession(data.get("session")), int(data.get("api_id")), data.get("api_hash"))
             await client.connect()
             try:
-                await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+                await client.sign_in(phone=data.get("phone"), code=data.get("code"), phone_code_hash=data.get("phone_code_hash"))
             except SessionPasswordNeededError:
                 new_session = client.session.save()
                 await client.disconnect()
-                return {"status": "2fa", "session": new_session, "message": "Vui lòng nhập mật khẩu 2FA."}
-            except Exception as e:
+                return {"status": "2fa", "session": new_session, "message": "Nhập mật khẩu 2FA."}
+            except Exception:
                 await client.disconnect()
-                return {"status": "error", "message": "Mã OTP không đúng hoặc đã hết hạn."}
+                return {"status": "error", "message": "Mã OTP sai hoặc hết hạn."}
             
             new_session = client.session.save()
             await client.disconnect()
+            start_background_listener(new_session, data.get("api_id"), data.get("api_hash"))
             return {"status": "ok", "session": new_session}
         except Exception as e:
             return {"status": "error", "message": str(e)}
-
-    result = asyncio.run(_verify())
-    return jsonify(result)
+    return jsonify(asyncio.run(_verify()))
 
 @flask_app.route("/api/verify_2fa", methods=["POST"])
 def api_verify_2fa():
     data = request.json
-    api_id = data.get("api_id")
-    api_hash = data.get("api_hash")
-    password = data.get("password")
-    session_str = data.get("session")
-
     async def _verify_2fa():
         try:
-            client = TelegramClient(StringSession(session_str), int(api_id), api_hash)
+            client = TelegramClient(StringSession(data.get("session")), int(data.get("api_id")), data.get("api_hash"))
             await client.connect()
             try:
-                await client.sign_in(password=password)
-            except Exception as e:
+                await client.sign_in(password=data.get("password"))
+            except Exception:
                 await client.disconnect()
-                return {"status": "error", "message": "Mật khẩu 2FA không chính xác."}
+                return {"status": "error", "message": "Mật khẩu 2FA sai."}
             
             new_session = client.session.save()
             await client.disconnect()
+            start_background_listener(new_session, data.get("api_id"), data.get("api_hash"))
             return {"status": "ok", "session": new_session}
         except Exception as e:
             return {"status": "error", "message": str(e)}
+    return jsonify(asyncio.run(_verify_2fa()))
 
-    result = asyncio.run(_verify_2fa())
-    return jsonify(result)
-
-@flask_app.route("/api/get_codes", methods=["POST"])
-def api_get_codes():
+@flask_app.route("/api/login_lc79", methods=["POST"])
+def api_login_lc79():
     data = request.json
-    api_id = data.get("api_id")
-    api_hash = data.get("api_hash")
-    session_str = data.get("session")
+    un, pw = data.get("username"), data.get("password")
+    user_id = data.get("user_id")
+    
+    if user_id:
+        STATE["user_chat_id"] = user_id
+        
+    if not un or not pw:
+        return jsonify({"status": "error", "message": "Thiếu thông tin."})
+    
+    md5_pw = hashlib.md5(pw.encode()).hexdigest()
+    acc = Account(un, md5_pw, un)
+    
+    if acc.refresh_token():
+        STATE["lc79_account"] = acc
+        for item in STATE["codes"]:
+            if item["status"] == "Pending":
+                threading.Thread(target=redeem_thread, args=(item, acc)).start()
+        return jsonify({"status": "ok"})
+    return jsonify({"status": "error", "message": "Sai tài khoản/mật khẩu LC79."})
 
-    async def _get_codes():
-        client = None
-        try:
-            client = TelegramClient(StringSession(session_str), int(api_id), api_hash)
-            await client.connect()
+@flask_app.route("/api/start_listener", methods=["POST"])
+def api_start_listener():
+    data = request.json
+    if data.get("user_id"):
+        STATE["user_chat_id"] = data.get("user_id")
+    if data.get("session"):
+        start_background_listener(data.get("session"), data.get("api_id"), data.get("api_hash"))
+    return jsonify({"status": "ok"})
 
-            channel_entity = None
-
-            # 1. Quét qua danh sách Dialogs (Cuộc trò chuyện) để tìm kênh
-            try:
-                async for dialog in client.iter_dialogs(limit=200):
-                    if dialog.id == -1002237214360 or (dialog.entity and getattr(dialog.entity, 'username', '') == 'codelaucuagame'):
-                        channel_entity = dialog.entity
-                        break
-            except Exception as e:
-                logger.warning(f"Lỗi quét dialogs: {e}")
-
-            # 2. Nếu chưa có, thử get_entity bằng username
-            if not channel_entity:
-                try:
-                    channel_entity = await client.get_entity('codelaucuagame')
-                except Exception:
-                    pass
-
-            # 3. Thử get_entity bằng link
-            if not channel_entity:
-                try:
-                    channel_entity = await client.get_entity('https://t.me/codelaucuagame')
-                except Exception:
-                    pass
-
-            # 4. Thử get_entity bằng ID
-            if not channel_entity:
-                try:
-                    channel_entity = await client.get_entity(-1002237214360)
-                except Exception:
-                    pass
-
-            if not channel_entity:
-                return {"status": "error", "message": "Không thể tìm thấy kênh. Tài khoản có thể chưa join hoặc kênh bị ẩn."}
-
-            # Thực hiện join nếu chưa tham gia
-            try:
-                await client(functions.channels.JoinChannelRequest(channel=channel_entity))
-                logger.info("Đã join kênh thành công.")
-            except Exception as e:
-                logger.info(f"Join channel note (có thể đã join rồi): {e}")
-
-            # Lấy 100 tin nhắn gần nhất
-            codes = []
-            pattern = re.compile(r'LC79[A-Z0-9]+')
-            logger.info("Bắt đầu quét tin nhắn tìm code...")
-
-            async for msg in client.iter_messages(channel_entity, limit=100):
-                # FIX LỖI TẠI ĐÂY: Dùng getattr để tránh lỗi MessageService object has no attribute 'caption'
-                # Telethon dùng .message để lấy text hoặc caption của media an toàn nhất
-                raw_text = getattr(msg, 'message', '')
-                if not raw_text:
-                    raw_text = getattr(msg, 'text', '')
-                
-                if not raw_text:
-                    continue
-                    
-                matches = pattern.findall(raw_text)
-                for match in matches:
-                    stripped_code = match[4:].strip()
-                    if stripped_code and stripped_code not in codes:
-                        codes.append(stripped_code)
-                        logger.info(f"Tìm thấy code: {stripped_code}")
-                    
-                    if len(codes) >= 10:
-                        break
-                        
-                if len(codes) >= 10:
-                    break
-
-            if not codes:
-                return {"status": "error", "message": "Không tìm thấy code LC79 nào trong 100 tin nhắn gần nhất."}
-
-            return {"status": "ok", "codes": codes}
-            
-        except Exception as e:
-            logger.error(f"Lỗi get_codes: {e}")
-            return {"status": "error", "message": f"Lỗi: {str(e)}"}
-        finally:
-            if client and client.is_connected():
-                await client.disconnect()
-
-    result = asyncio.run(_get_codes())
-    return jsonify(result)
-
+@flask_app.route("/api/state", methods=["GET"])
+def api_state():
+    return jsonify({"codes": STATE["codes"], "has_lc79": STATE["lc79_account"] is not None})
 
 # ================================================================
-#                    MINI APP HTML (VIP GLASSMORPHISM)
+#                    MINI APP HTML
 # ================================================================
 MINIAPP_HTML = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-<meta name="theme-color" content="#05050a">
-<title>Auto Tool Center - VIP</title>
+<meta name="theme-color" content="#f8fafc">
+<title>Auto Tool Center</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
-
 :root{
-  --bg: #05050a;
-  --card: rgba(20, 24, 39, 0.6);
-  --card-hover: rgba(30, 35, 55, 0.8);
-  --accent: #8b5cf6;
-  --accent-glow: rgba(139, 92, 246, 0.4);
-  --accent2: #06b6d4;
-  --text: #f8fafc;
-  --muted: #94a3b8;
-  --border: rgba(255, 255, 255, 0.08);
-  --danger: #ef4444;
+  --bg: #f1f5f9;
+  --surface: #ffffff;
+  --text: #0f172a;
+  --text-muted: #64748b;
+  --primary: #3b82f6;
+  --primary-hover: #2563eb;
   --success: #10b981;
+  --danger: #ef4444;
+  --border: #e2e8f0;
 }
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
-html, body { touch-action: pan-x pan-y; height: 100%; }
 body{
-  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
-  background: var(--bg); color: var(--text); min-height: 100vh;
-  padding: 20px 16px 40px; overflow-x: hidden;
-  background-image: 
-    radial-gradient(circle at 0% 0%, rgba(139, 92, 246, 0.15) 0%, transparent 50%),
-    radial-gradient(circle at 100% 100%, rgba(6, 182, 212, 0.15) 0%, transparent 50%);
-  background-attachment: fixed;
+  font-family: 'Inter', -apple-system, sans-serif;
+  background: var(--bg); color: var(--text);
+  min-height: 100vh; padding: 20px 16px;
+  display: flex; flex-direction: column; align-items: center;
 }
-body>*{position:relative; z-index:1}
-
-.icon { width: 24px; height: 24px; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; fill: none; }
-.icon-sm { width: 18px; height: 18px; }
-.icon-lg { width: 32px; height: 32px; }
-
-.view{display:none; animation:viewIn .4s cubic-bezier(0.16, 1, 0.3, 1)}
-.view.active{display:block}
-@keyframes viewIn{from{opacity:0;transform:translateY(15px) scale(0.98)}to{opacity:1;transform:none}}
-
-.header{text-align:center;padding:30px 0 30px}
-.logo{
-  display:inline-flex; align-items:center; justify-content:center;
-  width: 80px; height: 80px; border-radius: 24px;
-  background: linear-gradient(135deg, rgba(139, 92, 246, 0.2), rgba(6, 182, 212, 0.2));
-  border: 1px solid rgba(139, 92, 246, 0.4);
-  color: var(--accent); margin-bottom: 20px; 
-  box-shadow: 0 10px 40px rgba(139, 92, 246, 0.2), inset 0 0 20px rgba(139, 92, 246, 0.1);
-  backdrop-filter: blur(10px);
+.app-container { width: 100%; max-width: 480px; }
+.view{display:none; animation:fadeIn .3s ease;}
+.view.active{display:block;}
+@keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.card {
+  background: var(--surface); border-radius: 16px; padding: 24px 20px;
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.05);
+  border: 1px solid var(--border); margin-bottom: 16px;
 }
-.header h1{font-size: 26px; font-weight: 800; letter-spacing: -0.8px; margin-bottom: 8px;}
-.header h1 span { background: linear-gradient(to right, #a78bfa, #22d3ee); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-.header p{color:var(--muted);font-size:14px; font-weight: 500;}
-
-.section-title{font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 1.5px; margin: 24px 4px 16px; display: flex; align-items: center; gap: 8px;}
-.section-title::after { content: ''; flex: 1; height: 1px; background: linear-gradient(90deg, var(--border), transparent); }
-
-.grid{display:grid; grid-template-columns:1fr 1fr; gap:14px}
-.service{
-  background: var(--card); border: 1px solid var(--border); border-radius: 20px;
-  padding: 20px 16px; cursor: pointer; transition: all 0.3s ease;
-  display: flex; flex-direction: column; gap: 14px; position: relative;
-  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+.header { text-align: center; margin-bottom: 24px; }
+.header h1 { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
+.header p { color: var(--text-muted); font-size: 14px; }
+.input-group { margin-bottom: 16px; }
+.input-group label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.input-group input {
+  width: 100%; padding: 14px 16px; border-radius: 12px;
+  border: 1px solid var(--border); font-size: 15px; outline: none; transition: 0.2s;
+  background: #f8fafc;
 }
-.service:active{transform:scale(0.96); background: var(--card-hover); border-color: rgba(255,255,255,0.15);}
-.service .ico{color: var(--accent);}
-.service .name{font-size: 15px; font-weight: 700;}
-.service .sub{font-size: 12px; color: var(--muted); font-weight: 500;}
-.service.full{grid-column:1 / -1; flex-direction:row; align-items:center; gap:16px; padding: 22px 20px;}
-.service.full .ico{color: var(--accent2);}
-.service.full .info{flex:1; display:flex; flex-direction:column; gap:4px;}
-.service.full .arrow{color: var(--muted); transition: 0.3s;}
-.service.full:active .arrow{transform: translateX(6px); color: var(--text);}
-.service.featured{background: linear-gradient(135deg, rgba(139,92,246,0.1), rgba(6,182,212,0.05)); border-color: rgba(139, 92, 246, 0.3);}
-.service .hot{position: absolute; top: 12px; right: 12px; font-size: 9px; font-weight: 800; letter-spacing: 0.5px; padding: 4px 10px; border-radius: 99px; background: linear-gradient(135deg, #ec4899, #8b5cf6); color: #fff; box-shadow: 0 4px 12px rgba(236, 72, 153, 0.4);}
-
-.back-btn{display: inline-flex; align-items: center; gap: 8px; background: rgba(255,255,255,0.05); border: 1px solid var(--border); color: var(--text); padding: 10px 18px; border-radius: 12px; font-size: 14px; font-weight: 600; cursor: pointer; margin-bottom: 20px; transition: 0.2s;}
-.back-btn:active{transform:scale(0.95); background: rgba(255,255,255,0.1);}
-
-.lc-header{background: linear-gradient(135deg, rgba(30, 35, 55, 0.8), rgba(20, 24, 39, 0.6)); border: 1px solid var(--border); border-radius: 24px; padding: 32px 20px; margin-bottom: 20px; text-align: center; backdrop-filter: blur(12px); position: relative; overflow: hidden;}
-.lc-header::before { content: ''; position: absolute; top: 0; left: 0; width: 100%; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), transparent); }
-.lc-icon{display: inline-flex; align-items: center; justify-content: center; width: 64px; height: 64px; border-radius: 20px; background: rgba(139, 92, 246, 0.15); color: var(--accent); margin-bottom: 16px; border: 1px solid rgba(139, 92, 246, 0.3);}
-.lc-header h2{font-size: 22px; font-weight: 800; margin-bottom: 8px; letter-spacing: -0.5px;}
-.lc-header p{font-size: 13px; color: var(--muted); font-weight: 500;}
-
-.panel{background: var(--card); border: 1px solid var(--border); border-radius: 24px; padding: 24px 20px; backdrop-filter: blur(12px);}
-.panel label{font-size: 12px; font-weight: 700; color: var(--muted); display: flex; align-items: center; gap: 6px; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px;}
-.panel input{width: 100%; background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 14px; padding: 16px; color: var(--text); font-size: 15px; font-weight: 500; outline: none; transition: 0.3s; margin-bottom: 20px;}
-.panel input:focus{border-color: var(--accent); box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.15); background: rgba(0,0,0,0.5);}
-.panel input::placeholder { color: rgba(148, 163, 184, 0.5); }
-
-.btn{width: 100%; padding: 16px; border: none; border-radius: 14px; font-size: 16px; font-weight: 700; cursor: pointer; transition: 0.2s; display: flex; align-items: center; justify-content: center; gap: 8px; color: #fff; background: linear-gradient(135deg, #8b5cf6, #6366f1); box-shadow: 0 8px 24px var(--accent-glow);}
-.btn:active{transform: scale(0.97); box-shadow: none;}
-.btn:disabled {opacity: 0.6; pointer-events: none;}
-
-.code-box { background: rgba(0,0,0,0.3); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; font-family: 'Courier New', monospace; font-size: 16px; color: #34d399; font-weight: 800; letter-spacing: 1.5px;}
-.copy-btn { background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); color: #34d399; padding: 8px 14px; border-radius: 8px; cursor: pointer; font-weight: 700; font-size: 12px; transition: 0.2s;}
-.copy-btn:active { background: #10b981; color: #000; }
-
-.footer{text-align: center; color: var(--muted); font-size: 12px; margin-top: 40px; font-weight: 500;}
+.input-group input:focus { border-color: var(--primary); background: #fff; box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1); }
+.btn {
+  width: 100%; padding: 16px; border: none; border-radius: 12px;
+  background: var(--primary); color: white; font-size: 16px; font-weight: 600;
+  cursor: pointer; transition: 0.2s; display: flex; justify-content: center; align-items: center; gap: 8px;
+  margin-top: 8px;
+}
+.btn:active { transform: scale(0.98); }
+.btn:disabled { opacity: 0.6; pointer-events: none; }
+.code-list { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
+.code-item {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 14px 16px; border-radius: 12px; border: 1px solid var(--border);
+  background: #f8fafc; animation: slideIn 0.2s ease;
+}
+@keyframes slideIn { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: none; } }
+.code-left { display: flex; flex-direction: column; gap: 4px; }
+.code-text { font-family: monospace; font-size: 16px; font-weight: 700; letter-spacing: 1px; color: var(--text); }
+.code-msg { font-size: 12px; color: var(--text-muted); font-weight: 500; }
+.code-status { font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 99px; }
+.status-Pending { background: #fef3c7; color: #d97706; }
+.status-Processing { background: #e0f2fe; color: #0284c7; }
+.status-Success { background: #d1fae5; color: #059669; }
+.status-Failed { background: #fee2e2; color: #dc2626; }
+.back-btn { background: none; border: none; color: var(--text-muted); font-size: 14px; font-weight: 500; cursor: pointer; margin-bottom: 16px; display: inline-flex; align-items: center; gap: 4px; }
 </style>
 </head>
 <body>
-
-<!-- =================== VIEW 1: HOME =================== -->
-<div id="view-home" class="view active">
-  <div class="header">
-    <div class="logo"><svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
-    <h1>Auto Tool <span>VIP</span></h1>
-    <p>Hệ thống tự động hóa thế hệ mới</p>
-  </div>
-  <div class="section-title">Dịch vụ cao cấp</div>
-  <div class="grid">
-    <div class="service featured full" onclick="openLogin()">
-      <div class="hot">HOT VIP</div>
-      <div class="ico"><svg class="icon icon-lg" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><line x1="6" y1="12" x2="10" y2="12"/><line x1="8" y1="10" x2="8" y2="14"/><line x1="15" y1="13" x2="15.01" y2="13"/><line x1="18" y1="11" x2="18.01" y2="11"/></svg></div>
-      <div class="info">
-        <div class="name">Tool Auto LC79</div>
-        <div class="sub">Tự động lấy code từ kênh Telegram</div>
-      </div>
-      <div class="arrow"><svg class="icon" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg></div>
+<div class="app-container">
+  <!-- VIEW 1: TELEGRAM LOGIN -->
+  <div id="view-tg-login" class="view">
+    <div class="header"><h1>Kết Nối Telegram</h1><p>Nhập API để bắt đầu lấy code</p></div>
+    <div class="card">
+      <div class="input-group"><label>API ID</label><input type="number" id="apiId" placeholder="VD: 12345678"></div>
+      <div class="input-group"><label>API HASH</label><input type="password" id="apiHash" placeholder="Nhập API HASH"></div>
+      <div class="input-group"><label>Số điện thoại</label><input type="tel" id="phone" placeholder="VD: +84987654321"></div>
+      <button class="btn" id="btn-send-code" onclick="sendCode()">Tiếp Tục</button>
     </div>
   </div>
-</div>
 
-<!-- =================== VIEW 2: LOGIN (API) =================== -->
-<div id="view-login" class="view">
-  <button class="back-btn" onclick="goHome()"><svg class="icon icon-sm" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg> Quay lại</button>
-  <div class="lc-header">
-    <div class="lc-icon"><svg class="icon icon-lg" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
-    <h2>Xác Thực API</h2>
-    <p>Kết nối Telegram để sử dụng Tool</p>
+  <!-- VIEW 2: OTP -->
+  <div id="view-tg-otp" class="view">
+    <button class="back-btn" onclick="showView('view-tg-login')">← Quay lại</button>
+    <div class="header"><h1>Nhập Mã OTP</h1><p>Kiểm tra tin nhắn Telegram của bạn</p></div>
+    <div class="card">
+      <div class="input-group"><label>Mã OTP</label><input type="text" id="otpCode" placeholder="Nhập 5 chữ số" inputmode="numeric"></div>
+      <button class="btn" id="btn-verify" onclick="verifyCode()">Xác Nhận</button>
+    </div>
   </div>
-  <div class="panel">
-    <label>API ID</label>
-    <input type="number" id="apiId" placeholder="VD: 12345678" autocomplete="off">
-    
-    <label>API HASH</label>
-    <input type="password" id="apiHash" placeholder="Nhập API HASH" autocomplete="off">
-    
-    <label>Số điện thoại</label>
-    <input type="tel" id="phone" placeholder="VD: +84987654321" autocomplete="off">
-    
-    <button class="btn" id="btn-send-code" onclick="sendCode()">Tiếp Tục <svg class="icon icon-sm" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg></button>
-  </div>
-</div>
 
-<!-- =================== VIEW 3: OTP VERIFY =================== -->
-<div id="view-otp" class="view">
-  <button class="back-btn" onclick="showView('view-login')"><svg class="icon icon-sm" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg> Quay lại</button>
-  <div class="lc-header">
-    <div class="lc-icon" style="color: var(--accent2); background: rgba(6,182,212,0.1); border-color: rgba(6,182,212,0.3);"><svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg></div>
-    <h2>Nhập Mã OTP</h2>
-    <p>Mã xác thực đã được gửi tới Telegram</p>
+  <!-- VIEW 3: 2FA -->
+  <div id="view-tg-2fa" class="view">
+    <div class="header"><h1>Xác Thực 2 Lớp</h1><p>Tài khoản của bạn có bật 2FA</p></div>
+    <div class="card">
+      <div class="input-group"><label>Mật khẩu 2FA</label><input type="password" id="password2fa" placeholder="Nhập mật khẩu 2FA"></div>
+      <button class="btn" id="btn-verify-2fa" onclick="verify2FA()">Đăng Nhập</button>
+    </div>
   </div>
-  <div class="panel">
-    <label>Mã OTP</label>
-    <input type="text" id="otpCode" placeholder="Nhập 5 chữ số" inputmode="numeric" autocomplete="one-time-code">
-    <button class="btn" id="btn-verify" onclick="verifyCode()">Xác Nhận OTP</button>
-  </div>
-</div>
 
-<!-- =================== VIEW 4: 2FA PASSWORD =================== -->
-<div id="view-2fa" class="view">
-  <button class="back-btn" onclick="showView('view-otp')"><svg class="icon icon-sm" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg> Quay lại</button>
-  <div class="lc-header" style="border-color: rgba(239, 68, 68, 0.3);">
-    <div class="lc-icon" style="color: var(--danger); background: rgba(239, 68, 68, 0.1); border-color: rgba(239, 68, 68, 0.3);"><svg class="icon icon-lg" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
-    <h2>Xác Thực 2 Lớp</h2>
-    <p>Tài khoản của bạn được bảo vệ bằng 2FA</p>
+  <!-- VIEW 4: LC79 LOGIN -->
+  <div id="view-lc79-login" class="view">
+    <div class="header"><h1>Đăng Nhập LC79</h1><p>Tool sẽ tự động nhập code khi có mã mới</p></div>
+    <div class="card">
+      <div class="input-group"><label>Tài khoản LC79</label><input type="text" id="lc79User" placeholder="Nhập tên đăng nhập"></div>
+      <div class="input-group"><label>Mật khẩu LC79</label><input type="password" id="lc79Pass" placeholder="Nhập mật khẩu (chưa mã hoá)"></div>
+      <button class="btn" id="btn-login-lc79" onclick="loginLC79()">Kết Nối & Chạy Auto</button>
+    </div>
   </div>
-  <div class="panel">
-    <label>Mật khẩu 2FA</label>
-    <input type="password" id="password2fa" placeholder="Nhập mật khẩu 2FA của bạn" autocomplete="off">
-    <button class="btn" id="btn-verify-2fa" onclick="verify2FA()">Đăng Nhập Ngay</button>
-  </div>
-</div>
 
-<!-- =================== VIEW 5: RESULT CODES =================== -->
-<div id="view-result" class="view">
-  <div class="lc-header" style="padding: 24px; border-color: rgba(16, 185, 129, 0.3);">
-    <div class="lc-icon" style="background: rgba(16, 185, 129, 0.1); color: var(--success); border-color: rgba(16, 185, 129, 0.3);"><svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></div>
-    <h2>Đăng Nhập VIP</h2>
-    <p>10 Mã Code mới nhất từ kênh LC79</p>
+  <!-- VIEW 5: DASHBOARD -->
+  <div id="view-dashboard" class="view">
+    <div class="header"><h1>Hệ Thống Đang Chạy</h1><p>Đang chờ code mới từ kênh...</p></div>
+    <div class="card" style="padding: 16px;">
+      <div class="code-list" id="code-list"></div>
+    </div>
   </div>
-  
-  <div class="panel" id="codes-container" style="padding: 16px;">
-    <!-- Codes will be injected here -->
-  </div>
-  
-  <button class="btn" style="margin-top: 20px; background: rgba(255,255,255,0.05); border: 1px solid var(--border); box-shadow: none;" onclick="goHome()">Về Trang Chủ</button>
 </div>
 
 <script>
 const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
+const tgUserId = tg?.initDataUnsafe?.user?.id;
 
 let authData = { api_id: '', api_hash: '', phone: '', phone_code_hash: '', session: '', password: '' };
+let pollInterval = null;
 
 function showView(id) {
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
   document.getElementById(id).classList.add('active');
-  window.scrollTo({top:0, behavior:'smooth'});
 }
-
-function openLogin() { showView('view-login'); }
-function goHome() { showView('view-home'); }
 
 async function sendCode() {
   const api_id = document.getElementById('apiId').value.trim();
   const api_hash = document.getElementById('apiHash').value.trim();
   const phone = document.getElementById('phone').value.trim();
-
-  if (!api_id || !api_hash || !phone) {
-    alert("Vui lòng nhập đầy đủ thông tin!");
-    return;
-  }
-
+  if (!api_id || !api_hash || !phone) return alert("Nhập đủ thông tin!");
   const btn = document.getElementById('btn-send-code');
-  btn.innerText = "Đang gửi OTP..."; btn.disabled = true;
+  btn.innerText = "Đang gửi..."; btn.disabled = true;
 
   try {
     const res = await fetch('/api/send_code', {
@@ -450,24 +518,17 @@ async function sendCode() {
       body: JSON.stringify({ api_id, api_hash, phone })
     });
     const data = await res.json();
-
     if (data.status === 'ok') {
       authData = { ...authData, api_id, api_hash, phone, phone_code_hash: data.phone_code_hash, session: data.session };
-      showView('view-otp');
-    } else {
-      alert("Lỗi: " + data.message);
-    }
-  } catch (e) {
-    alert("Lỗi kết nối Server!");
-  } finally {
-    btn.innerText = "Tiếp Tục"; btn.disabled = false;
-  }
+      showView('view-tg-otp');
+    } else alert("Lỗi: " + data.message);
+  } catch (e) { alert("Lỗi mạng!"); }
+  finally { btn.innerText = "Tiếp Tục"; btn.disabled = false; }
 }
 
 async function verifyCode() {
   const code = document.getElementById('otpCode').value.trim();
-  if (!code) { alert("Vui lòng nhập OTP!"); return; }
-
+  if (!code) return alert("Nhập OTP!");
   const btn = document.getElementById('btn-verify');
   btn.innerText = "Đang xác thực..."; btn.disabled = true;
 
@@ -477,27 +538,18 @@ async function verifyCode() {
       body: JSON.stringify({ ...authData, code })
     });
     const data = await res.json();
-
-    if (data.status === 'ok') {
+    if (data.status === 'ok') saveSessionAndStart(data.session);
+    else if (data.status === '2fa') {
       authData.session = data.session;
-      await fetchCodes(); 
-    } else if (data.status === '2fa') {
-      authData.session = data.session;
-      showView('view-2fa');
-    } else {
-      alert("Lỗi: " + data.message);
-      btn.innerText = "Xác Nhận"; btn.disabled = false;
-    }
-  } catch (e) {
-    alert("Lỗi xác thực!");
-    btn.innerText = "Xác Nhận"; btn.disabled = false;
-  }
+      showView('view-tg-2fa');
+    } else alert("Lỗi: " + data.message);
+  } catch (e) { alert("Lỗi mạng!"); }
+  finally { btn.innerText = "Xác Nhận"; btn.disabled = false; }
 }
 
 async function verify2FA() {
   const password = document.getElementById('password2fa').value.trim();
-  if (!password) { alert("Vui lòng nhập mật khẩu 2FA!"); return; }
-
+  if (!password) return alert("Nhập mật khẩu 2FA!");
   const btn = document.getElementById('btn-verify-2fa');
   btn.innerText = "Đang xác thực..."; btn.disabled = true;
 
@@ -507,70 +559,112 @@ async function verify2FA() {
       body: JSON.stringify({ ...authData, password })
     });
     const data = await res.json();
-
-    if (data.status === 'ok') {
-      authData.session = data.session;
-      await fetchCodes();
-    } else {
-      alert("Lỗi: " + data.message);
-      btn.innerText = "Đăng Nhập Ngay"; btn.disabled = false;
-    }
-  } catch (e) {
-    alert("Lỗi xác thực 2FA!");
-    btn.innerText = "Đăng Nhập Ngay"; btn.disabled = false;
-  }
+    if (data.status === 'ok') saveSessionAndStart(data.session);
+    else alert("Lỗi: " + data.message);
+  } catch (e) { alert("Lỗi mạng!"); }
+  finally { btn.innerText = "Đăng Nhập"; btn.disabled = false; }
 }
 
-async function fetchCodes() {
-  try {
-    showView('view-result');
-    const container = document.getElementById('codes-container');
-    container.innerHTML = '<div style="text-align:center; color:var(--muted); padding: 20px;">Đang quét kênh và lấy code...</div>';
+function saveSessionAndStart(session) {
+  authData.session = session;
+  localStorage.setItem('tg_session', session);
+  localStorage.setItem('api_id', authData.api_id);
+  localStorage.setItem('api_hash', authData.api_hash);
+  
+  fetch('/api/start_listener', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session, api_id: authData.api_id, api_hash: authData.api_hash, user_id: tgUserId })
+  });
+  showView('view-lc79-login');
+}
 
-    const res = await fetch('/api/get_codes', {
+async function loginLC79() {
+  const username = document.getElementById('lc79User').value.trim();
+  const password = document.getElementById('lc79Pass').value.trim();
+  if (!username || !password) return alert("Nhập đủ tài khoản/mật khẩu!");
+  const btn = document.getElementById('btn-login-lc79');
+  btn.innerText = "Đang kết nối..."; btn.disabled = true;
+
+  try {
+    const res = await fetch('/api/login_lc79', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(authData)
+      body: JSON.stringify({ username, password, user_id: tgUserId })
     });
     const data = await res.json();
-
     if (data.status === 'ok') {
-      container.innerHTML = '';
-      if (data.codes.length === 0) {
-        container.innerHTML = '<div style="text-align:center; color:var(--muted); padding: 20px;">Không tìm thấy code nào mới.</div>';
+      showView('view-dashboard');
+      startPolling();
+    } else alert("Lỗi: " + data.message);
+  } catch (e) { alert("Lỗi mạng!"); }
+  finally { btn.innerText = "Kết Nối & Chạy Auto"; btn.disabled = false; }
+}
+
+function startPolling() {
+  if (pollInterval) clearInterval(pollInterval);
+  pollInterval = setInterval(async () => {
+    try {
+      const res = await fetch('/api/state');
+      const data = await res.json();
+      renderCodes(data.codes);
+    } catch (e) {}
+  }, 100);
+}
+
+function renderCodes(codes) {
+  const container = document.getElementById('code-list');
+  if (!codes || codes.length === 0) {
+    container.innerHTML = '<div style="text-align:center; color:var(--text-muted); padding:20px 0; font-size:14px;">Đang chờ code mới...</div>';
+    return;
+  }
+  let html = '';
+  codes.forEach(item => {
+    let statusClass = 'status-Pending';
+    if (item.status === 'Success') statusClass = 'status-Success';
+    if (item.status === 'Failed') statusClass = 'status-Failed';
+    if (item.status === 'Processing') statusClass = 'status-Processing';
+    html += `
+      <div class="code-item">
+        <div class="code-left">
+          <div class="code-text">${item.code}</div>
+          <div class="code-msg">${item.msg || ''}</div>
+        </div>
+        <div class="code-status ${statusClass}">${item.status}</div>
+      </div>
+    `;
+  });
+  container.innerHTML = html;
+}
+
+async function init() {
+  const savedSession = localStorage.getItem('tg_session');
+  const savedApiId = localStorage.getItem('api_id');
+  const savedApiHash = localStorage.getItem('api_hash');
+
+  if (savedSession && savedApiId && savedApiHash) {
+    fetch('/api/start_listener', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: savedSession, api_id: savedApiId, api_hash: savedApiHash, user_id: tgUserId })
+    });
+    try {
+      const res = await fetch('/api/state');
+      const data = await res.json();
+      if (data.has_lc79) {
+        showView('view-dashboard');
+        startPolling();
       } else {
-        data.codes.forEach((code, index) => {
-          const div = document.createElement('div');
-          div.className = 'code-box';
-          div.innerHTML = `<span>${index + 1}. ${code}</span> <button class="copy-btn" onclick="copyText('${code}')">COPY</button>`;
-          container.appendChild(div);
-        });
+        showView('view-lc79-login');
       }
-    } else {
-      container.innerHTML = `<div style="color: var(--danger); text-align:center; padding: 20px;">Lỗi: ${data.message}</div>`;
-    }
-  } catch (e) {
-    document.getElementById('codes-container').innerHTML = `<div style="color: var(--danger); text-align:center; padding: 20px;">Lỗi kết nối!</div>`;
+    } catch (e) { showView('view-tg-login'); }
+  } else {
+    showView('view-tg-login');
   }
 }
-
-function copyText(text) {
-  navigator.clipboard.writeText(text).then(() => {
-    if (tg) tg.HapticFeedback?.notificationOccurred('success');
-    const t = document.createElement('div');
-    t.style.cssText = 'position:fixed;bottom:30px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg, #10b981, #059669);color:white;padding:12px 24px;border-radius:12px;font-size:14px;font-weight:700;z-index:9999;transition:0.3s;box-shadow:0 10px 20px rgba(16,185,129,0.3)';
-    t.innerText = "Đã copy: " + text;
-    document.body.appendChild(t);
-    setTimeout(() => { t.style.opacity = '0'; t.style.transform = 'translateX(-50%) translateY(20px)'; setTimeout(() => t.remove(), 300); }, 2000);
-  });
-}
+init();
 </script>
 </body>
 </html>
 """
 
-# ================================================================
-#                    FLASK ROUTES
-# ================================================================
 @flask_app.route("/")
 def index():
     return Response(MINIAPP_HTML, mimetype="text/html")
@@ -583,92 +677,66 @@ def health():
 #                    SELF-PING & BOT MAIN
 # ================================================================
 def keep_alive():
-    if not WEBAPP_URL:
-        return
+    if not WEBAPP_URL: return
     url = WEBAPP_URL.rstrip("/") + "/health"
     time.sleep(15)
     while True:
-        try:
-            requests.get(url, timeout=10)
-        except Exception:
-            pass
+        try: requests.get(url, timeout=10)
+        except: pass
         time.sleep(PING_INTERVAL)
 
 def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT, use_reloader=False, threaded=True)
 
-# Bot Telegram Premium Emojis (VIP Layout)
 START_MESSAGE = """
-<tg-emoji emoji-id="5368324170671202286">💎</tg-emoji> <b>AUTO TOOL CENTER — VIP</b> <tg-emoji emoji-id="5368324170671202286">💎</tg-emoji>
+<tg-emoji emoji-id="5368324170671202286">💎</tg-emoji> <b>AUTO TOOL VIP — LC79</b> <tg-emoji emoji-id="5368324170671202286">💎</tg-emoji>
 
 <tg-emoji emoji-id="5447644880824181073">👑</tg-emoji> <b>Chào mừng</b> <i>{name}</i> đến với hệ thống!
-<tg-emoji emoji-id="4960917714325121485">🔥</tg-emoji> Trải nghiệm tự động hóa đỉnh cao thế hệ mới.
+<tg-emoji emoji-id="4960917714325121485">🔥</tg-emoji> Tốc độ ánh sáng — Tự động lấy & nhập code.
 
 ━━━━━━━━━━━━━━━━━━━━
-<tg-emoji emoji-id="6235401323201735695">⚙️</tg-emoji> <b>TÍNH NĂNG VIP</b>
-<tg-emoji emoji-id="5276398495459370121">⚡</tg-emoji> Đăng nhập Telegram cá nhân an toàn.
-<tg-emoji emoji-id="5386714776240519929">🔐</tg-emoji> Hỗ trợ xác thực 2 lớp (2FA).
-<tg-emoji emoji-id="5368324170671202286">🎮</tg-emoji> Auto Join kênh & Lấy 10 code mới nhất.
-<tg-emoji emoji-id="5278578979322940035">🛡️</tg-emoji> Bảo mật 100% — Không lưu trữ dữ liệu.
+<tg-emoji emoji-id="5276398495459370121">⚡</tg-emoji> Quét tin nhắn Real-time (0.1s).
+<tg-emoji emoji-id="5386714776240519929">🤖</tg-emoji> Auto nhập code vào LC79.
+<tg-emoji emoji-id="5278578979322940035">🛡️</tg-emoji> Bảo mật MD5 — Không lưu mật khẩu.
 
 ━━━━━━━━━━━━━━━━━━━━
 🎯 <b>Bấm nút bên dưới để trải nghiệm ngay</b> 👇
 """
 
 KEYBOARD = InlineKeyboardMarkup([
-    [InlineKeyboardButton(
-        "🚀 MỞ MINI APP VIP",
-        web_app=WebAppInfo(url=WEBAPP_URL or "https://example.com")
-    )],
+    [InlineKeyboardButton("🚀 MỞ MINI APP VIP", web_app=WebAppInfo(url=WEBAPP_URL or "https://example.com"))],
 ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or "bạn"
     await update.message.reply_text(
-        START_MESSAGE.format(name=name),
-        parse_mode="HTML",
-        reply_markup=KEYBOARD,
-        disable_web_page_preview=True,
+        START_MESSAGE.format(name=name), parse_mode="HTML", reply_markup=KEYBOARD, disable_web_page_preview=True
     )
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Xử lý lỗi Conflict không làm sập bot"""
     if isinstance(context.error, Conflict):
-        logger.warning("⚠️ Phát hiện xung đột Bot (Conflict). Có thể có instance khác đang chạy. Đang chờ 10s...")
+        logger.warning("⚠️ Conflict Bot! Chờ 10s...")
         await asyncio.sleep(10)
     else:
-        logger.error(f"Lỗi không xác định: {context.error}")
+        logger.error(f"Lỗi: {context.error}")
 
 async def post_init(application: Application):
-    """Thiết lập Menu lệnh cho Bot"""
-    await application.bot.set_my_commands([
-        BotCommand("start", "Khởi động Bot và mở Mini App")
-    ])
+    await application.bot.set_my_commands([BotCommand("start", "Khởi động Tool")])
 
 def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN chưa set!")
-        return
-
+    if not BOT_TOKEN: return
     threading.Thread(target=keep_alive, daemon=True).start()
     threading.Thread(target=run_flask, daemon=True).start()
 
-    logger.info("Đang khởi động Bot VIP...")
-    
-    # Xóa Webhook cũ (nếu có) trước khi chạy Polling để tránh lỗi Conflict
     try:
         requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true", timeout=5)
-        logger.info("Đã dọn dẹp Webhook cũ.")
-    except Exception as e:
-        logger.warning(f"Không thể dọn webhook: {e}")
+    except: pass
 
     bot_app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     bot_app.add_handler(CommandHandler("start", start))
-    
-    # Thêm Error Handler để tránh crash bot khi có Conflict
     bot_app.add_error_handler(error_handler)
     
-    logger.info("Bot đang chạy polling...")
+    logger.info("Bot đang chạy...")
     bot_app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
