@@ -38,30 +38,82 @@ logger = logging.getLogger("AutoTool")
 
 flask_app = Flask(__name__)
 
+
+# ================================================================
+#              ASYNC LOOP MANAGER (FIX CHÍNH)
+# ================================================================
+class AsyncLoopManager:
+    """Chạy 1 event loop duy nhất trong background thread.
+    Mọi coroutine Telethon đều chạy trên loop này → không bị
+    'event loop must not change after connection'."""
+
+    def __init__(self):
+        self.loop = None
+        self.thread = None
+        self._started = False
+
+    def start(self):
+        if self._started:
+            return
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run, daemon=True, name="AsyncLoop")
+        self.thread.start()
+        self._started = True
+        logger.info("✅ AsyncLoopManager started")
+
+    def _run(self):
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_forever()
+        except Exception as e:
+            logger.error(f"AsyncLoop crash: {e}")
+
+    def run(self, coro, timeout=60):
+        """Chạy coroutine trên loop chính, block đến khi xong."""
+        if not self._started or not self.loop:
+            raise RuntimeError("AsyncLoopManager chưa start!")
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        return future.result(timeout=timeout)
+
+    def stop(self):
+        if self.loop:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self._started = False
+
+
+async_manager = AsyncLoopManager()
+
+
 # ============ SESSION STORAGE ============
 # {session_id: {"client": TelegramClient, "phone": str, "phone_code_hash": str,
-#               "api_id": int, "api_hash": str, "created": float}}
+#               "created": float}}
 sessions = {}
 SESSIONS_LOCK = threading.Lock()
 SESSION_TTL = 600  # 10 phút
 
 
 def cleanup_old_sessions():
-    """Background thread dọn session hết hạn"""
+    """Dọn session >10 phút — chạy trong thread riêng."""
     while True:
         try:
             time.sleep(60)
             now = time.time()
+            expired_ids = []
             with SESSIONS_LOCK:
-                expired = [sid for sid, s in sessions.items() if now - s["created"] > SESSION_TTL]
-                for sid in expired:
+                for sid, s in list(sessions.items()):
+                    if now - s["created"] > SESSION_TTL:
+                        expired_ids.append(sid)
+
+            for sid in expired_ids:
+                with SESSIONS_LOCK:
                     s = sessions.pop(sid, None)
-                    if s and s.get("client"):
-                        try:
-                            asyncio.run(s["client"].disconnect())
-                        except Exception:
-                            pass
-                    logger.info(f"Cleanup session {sid[:8]}...")
+                if s and s.get("client"):
+                    try:
+                        # Disconnect client qua async_manager để chạy đúng loop
+                        async_manager.run(s["client"].disconnect(), timeout=5)
+                    except Exception:
+                        pass
+                    logger.info(f"🧹 Cleaned session {sid[:8]}")
         except Exception as e:
             logger.warning(f"cleanup err: {e}")
 
@@ -73,7 +125,7 @@ def fmt_num(n):
         return str(n)
 
 
-# ============ GAME LOGIN ============
+# ============ GAME LOGIN (sync — requests) ============
 def login_game_sync(username, password):
     try:
         pw_hash = hashlib.md5(password.encode("utf-8")).hexdigest()
@@ -100,8 +152,8 @@ def login_game_sync(username, password):
         return {"status": "error", "message": f"Lỗi kết nối: {e}"}
 
 
-# ============ GET CODES ============
-async def fetch_codes_async(client):
+# ============ TELEGRAM ASYNC HELPERS ============
+async def _async_fetch_codes(client):
     channel_entity = None
     try:
         async for dialog in client.iter_dialogs(limit=200):
@@ -121,7 +173,7 @@ async def fetch_codes_async(client):
         except Exception: pass
     if not channel_entity:
         return {"status": "error",
-                "message": "Không tìm thấy kênh LC79. Tài khoản chưa join."}
+                "message": "Không tìm thấy kênh LC79. Tài khoản chưa join hoặc kênh ẩn."}
 
     try:
         await client(functions.channels.JoinChannelRequest(channel=channel_entity))
@@ -145,7 +197,7 @@ async def fetch_codes_async(client):
 
     if not codes:
         return {"status": "error",
-                "message": "Không tìm thấy code LC79 nào trong 100 tin gần nhất."}
+                "message": "Không tìm thấy code LC79 trong 100 tin gần nhất."}
     return {"status": "ok", "codes": codes}
 
 
@@ -178,50 +230,55 @@ def api_send_code():
                     "client": client,
                     "phone": phone,
                     "phone_code_hash": sent.phone_code_hash,
-                    "api_id": int(api_id),
-                    "api_hash": api_hash,
                     "created": time.time(),
                 }
-            logger.info(f"Session created {session_id[:8]}... phone={phone}")
+            logger.info(f"📱 Session {session_id[:8]} created for {phone}")
             return {"status": "ok", "session_id": session_id}
 
         except PhoneNumberInvalidError:
             if client and client.is_connected():
                 try: await client.disconnect()
                 except Exception: pass
-            return {"status": "error", "message": "Số điện thoại không hợp lệ. Nhập theo dạng +84987654321."}
+            return {"status": "error",
+                    "message": "SĐT không hợp lệ. Nhập dạng +84987654321."}
         except FloodWaitError as e:
             if client and client.is_connected():
                 try: await client.disconnect()
                 except Exception: pass
-            return {"status": "error", "message": f"Telegram giới hạn, chờ {e.seconds}s rồi thử lại."}
+            return {"status": "error",
+                    "message": f"Telegram giới hạn, chờ {e.seconds}s rồi thử lại."}
         except Exception as e:
             if client and client.is_connected():
                 try: await client.disconnect()
                 except Exception: pass
             logger.error(f"send_code err: {type(e).__name__}: {e}")
-            return {"status": "error", "message": f"Lỗi: {type(e).__name__}: {e}"}
+            return {"status": "error",
+                    "message": f"Lỗi: {type(e).__name__}: {e}"}
 
-    result = asyncio.run(_do())
+    try:
+        result = async_manager.run(_do(), timeout=45)
+    except Exception as e:
+        logger.error(f"async_manager send_code fail: {e}")
+        return jsonify({"status": "error", "message": f"Server lỗi: {e}"})
     return jsonify(result)
 
 
 @flask_app.route("/api/verify_code", methods=["POST"])
 def api_verify_code():
-    """🔑 Dùng CHÍNH client đã tạo khi send_code — ĐÂY LÀ FIX CHÍNH"""
     data = request.json or {}
     session_id = data.get("session_id")
     code = (data.get("code") or "").strip().replace(" ", "").replace("-", "")
 
     if not session_id or not code:
-        return jsonify({"status": "error", "message": "Thiếu session hoặc mã OTP."})
+        return jsonify({"status": "error",
+                        "message": "Thiếu session hoặc mã OTP."})
 
     with SESSIONS_LOCK:
         s = sessions.get(session_id)
 
     if not s:
         return jsonify({"status": "error",
-                        "message": "Phiên đã hết hạn (>10 phút). Vui lòng bắt đầu lại."})
+                        "message": "Phiên đã hết hạn (>10 phút). Bắt đầu lại."})
 
     async def _do():
         client = s["client"]
@@ -229,7 +286,8 @@ def api_verify_code():
             if not client.is_connected():
                 await client.connect()
         except Exception:
-            return {"status": "error", "message": "Mất kết nối tới Telegram. Bắt đầu lại."}
+            return {"status": "error",
+                    "message": "Mất kết nối Telegram. Bắt đầu lại."}
 
         try:
             await client.sign_in(
@@ -237,11 +295,10 @@ def api_verify_code():
                 code=code,
                 phone_code_hash=s["phone_code_hash"],
             )
-            logger.info(f"OTP OK session {session_id[:8]}")
+            logger.info(f"✅ OTP OK session {session_id[:8]}")
             return {"status": "ok"}
 
         except SessionPasswordNeededError:
-            logger.info(f"2FA required session {session_id[:8]}")
             return {"status": "2fa"}
 
         except PhoneCodeInvalidError:
@@ -249,7 +306,7 @@ def api_verify_code():
 
         except PhoneCodeExpiredError:
             return {"status": "error",
-                    "message": "Mã OTP đã hết hạn. Gửi lại mã mới."}
+                    "message": "Mã OTP đã hết hạn. Bắt đầu lại để nhận mã mới."}
 
         except FloodWaitError as e:
             return {"status": "error",
@@ -260,11 +317,15 @@ def api_verify_code():
                     "message": "Telegram yêu cầu restart. Bắt đầu lại từ đầu."}
 
         except Exception as e:
-            logger.error(f"verify_code unexpected {type(e).__name__}: {e}")
+            logger.error(f"verify_code {type(e).__name__}: {e}")
             return {"status": "error",
                     "message": f"Lỗi: {type(e).__name__}: {str(e)[:200]}"}
 
-    result = asyncio.run(_do())
+    try:
+        result = async_manager.run(_do(), timeout=45)
+    except Exception as e:
+        logger.error(f"async_manager verify_code fail: {e}")
+        return jsonify({"status": "error", "message": f"Server lỗi: {e}"})
     return jsonify(result)
 
 
@@ -275,7 +336,8 @@ def api_verify_2fa():
     password = data.get("password") or ""
 
     if not session_id or not password:
-        return jsonify({"status": "error", "message": "Thiếu session hoặc mật khẩu."})
+        return jsonify({"status": "error",
+                        "message": "Thiếu session hoặc mật khẩu."})
 
     with SESSIONS_LOCK:
         s = sessions.get(session_id)
@@ -289,17 +351,22 @@ def api_verify_2fa():
             if not client.is_connected():
                 await client.connect()
         except Exception:
-            return {"status": "error", "message": "Mất kết nối. Bắt đầu lại."}
+            return {"status": "error",
+                    "message": "Mất kết nối. Bắt đầu lại."}
 
         try:
             await client.sign_in(password=password)
-            logger.info(f"2FA OK session {session_id[:8]}")
+            logger.info(f"✅ 2FA OK session {session_id[:8]}")
             return {"status": "ok"}
         except Exception as e:
             logger.warning(f"2FA fail: {type(e).__name__}: {e}")
             return {"status": "error", "message": "Mật khẩu 2FA không đúng."}
 
-    result = asyncio.run(_do())
+    try:
+        result = async_manager.run(_do(), timeout=45)
+    except Exception as e:
+        logger.error(f"async_manager verify_2fa fail: {e}")
+        return jsonify({"status": "error", "message": f"Server lỗi: {e}"})
     return jsonify(result)
 
 
@@ -338,10 +405,15 @@ def api_get_codes():
             if not client.is_connected():
                 await client.connect()
         except Exception:
-            return {"status": "error", "message": "Mất kết nối. Bắt đầu lại."}
-        return await fetch_codes_async(client)
+            return {"status": "error",
+                    "message": "Mất kết nối. Bắt đầu lại."}
+        return await _async_fetch_codes(client)
 
-    result = asyncio.run(_do())
+    try:
+        result = async_manager.run(_do(), timeout=60)
+    except Exception as e:
+        logger.error(f"async_manager get_codes fail: {e}")
+        return jsonify({"status": "error", "message": f"Server lỗi: {e}"})
     return jsonify(result)
 
 
@@ -432,7 +504,7 @@ body>*{position:relative;z-index:1}
 .btn:active{transform:scale(0.97);box-shadow:none}
 .btn:disabled{opacity:0.6;pointer-events:none}
 .btn-ghost{background:rgba(255,255,255,0.05);border:1px solid var(--border);box-shadow:none}
-.alert{padding:14px 16px;border-radius:12px;font-size:13px;font-weight:600;margin-bottom:16px;display:none}
+.alert{padding:14px 16px;border-radius:12px;font-size:13px;font-weight:600;margin-bottom:16px;display:none;line-height:1.5}
 .alert.show{display:block}
 .alert-err{background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#fca5a5}
 .alert-ok{background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7}
@@ -462,7 +534,7 @@ body>*{position:relative;z-index:1}
 </head>
 <body>
 
-<!-- ============ HOME ============ -->
+<!-- HOME -->
 <div id="view-home" class="view active">
   <div class="header">
     <div class="logo"><svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
@@ -485,7 +557,7 @@ body>*{position:relative;z-index:1}
   <div class="footer">Powered by <a href="/alive" target="_blank">Auto Tool Server</a></div>
 </div>
 
-<!-- ============ STEP 1: API INFO ============ -->
+<!-- STEP 1: API INFO -->
 <div id="view-api" class="view">
   <button class="btn btn-ghost" style="margin-bottom:16px;padding:10px" onclick="showView('view-home')">← Quay lại</button>
   <div class="lc-header">
@@ -506,7 +578,7 @@ body>*{position:relative;z-index:1}
   </div>
 </div>
 
-<!-- ============ STEP 2: OTP ============ -->
+<!-- STEP 2: OTP -->
 <div id="view-otp" class="view">
   <button class="btn btn-ghost" style="margin-bottom:16px;padding:10px" onclick="restart()">← Làm lại</button>
   <div class="lc-header">
@@ -528,7 +600,7 @@ body>*{position:relative;z-index:1}
   </div>
 </div>
 
-<!-- ============ STEP 3: 2FA ============ -->
+<!-- STEP 3: 2FA -->
 <div id="view-2fa" class="view">
   <button class="btn btn-ghost" style="margin-bottom:16px;padding:10px" onclick="restart()">← Làm lại</button>
   <div class="lc-header" style="border-color:rgba(239,68,68,0.3)">
@@ -547,7 +619,7 @@ body>*{position:relative;z-index:1}
   </div>
 </div>
 
-<!-- ============ STEP 4: GAME LOGIN ============ -->
+<!-- STEP 4: GAME LOGIN -->
 <div id="view-game" class="view">
   <button class="btn btn-ghost" style="margin-bottom:16px;padding:10px" onclick="restart()">← Làm lại</button>
   <div class="lc-header" style="border-color:rgba(6,182,212,0.3)">
@@ -568,7 +640,7 @@ body>*{position:relative;z-index:1}
   </div>
 </div>
 
-<!-- ============ STEP 5: RESULT ============ -->
+<!-- STEP 5: RESULT -->
 <div id="view-result" class="view">
   <div class="lc-header" style="border-color:rgba(16,185,129,0.3)">
     <div class="lc-icon" style="color:var(--success);background:rgba(16,185,129,0.1);border-color:rgba(16,185,129,0.3)">
@@ -577,38 +649,20 @@ body>*{position:relative;z-index:1}
     <h2>Đăng Nhập Thành Công</h2>
     <p>Thông tin tài khoản & 10 code mới nhất</p>
   </div>
-
   <div class="info-card" id="game-info">
-    <div class="info-row">
-      <span class="info-label">Tài khoản</span>
-      <span class="info-value" id="info-username">-</span>
-    </div>
-    <div class="info-row">
-      <span class="info-label">Số dư Vin</span>
-      <span class="info-value" id="info-balance" style="color:var(--success)">0</span>
-    </div>
-    <div class="info-row">
-      <span class="info-label">Xu</span>
-      <span class="info-value" id="info-xu" style="color:var(--accent2)">0</span>
-    </div>
+    <div class="info-row"><span class="info-label">Tài khoản</span><span class="info-value" id="info-username">-</span></div>
+    <div class="info-row"><span class="info-label">Số dư Vin</span><span class="info-value" id="info-balance" style="color:var(--success)">0</span></div>
+    <div class="info-row"><span class="info-label">Xu</span><span class="info-value" id="info-xu" style="color:var(--accent2)">0</span></div>
   </div>
-
   <div class="section-title">Code LC79 mới nhất</div>
   <div class="panel" id="codes-container" style="padding:16px">
     <div style="text-align:center;color:var(--muted);padding:20px">Đang quét kênh...</div>
   </div>
-
   <button class="btn btn-ghost" style="margin-top:20px" onclick="restart()">🔄 Làm Lại Từ Đầu</button>
 </div>
 
 <script>
-let state = {
-  session_id: '',
-  gameUser: '',
-  gameBalance: 0,
-  gameXu: 0,
-  step: 0,
-};
+let state = { session_id:'', gameUser:'', gameBalance:0, gameXu:0 };
 
 function showView(id) {
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
@@ -617,14 +671,11 @@ function showView(id) {
 }
 
 function updateSteps(containerId, current) {
-  const total = 4;
   const el = document.getElementById(containerId);
   if (!el) return;
   let html = '';
-  for (let i = 1; i <= total; i++) {
-    let cls = '';
-    if (i < current) cls = 'done';
-    else if (i === current) cls = 'active';
+  for (let i = 1; i <= 4; i++) {
+    let cls = i < current ? 'done' : i === current ? 'active' : '';
     html += `<div class="step-dot ${cls}">${i}</div>`;
   }
   el.innerHTML = html;
@@ -635,9 +686,7 @@ function showAlert(id, message, type) {
   if (!el) return;
   el.className = 'alert alert-' + (type || 'err') + ' show';
   el.textContent = message;
-  setTimeout(() => { el.classList.remove('show'); }, 8000);
 }
-
 function hideAlert(id) {
   const el = document.getElementById(id);
   if (el) el.classList.remove('show');
@@ -648,7 +697,6 @@ function startFlow() {
   showView('view-api');
   updateSteps('steps1', 1);
 }
-
 function restart() {
   state.session_id = '';
   showView('view-home');
@@ -893,7 +941,7 @@ function fmt(s){var h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;retu
 async function tick(){
   try{
     var t0=performance.now();
-    var res=await fetch('/alive',{cache:'no-store'});
+    var res=await fetch('/api/ping',{cache:'no-store'});
     var t1=performance.now();
     var data=await res.json();
     document.getElementById('uptime').textContent=fmt(data.uptime);
@@ -937,12 +985,6 @@ def ping_json():
     })
 
 
-# Self-ping alias (tương thích JS /alive fetch nếu cần)
-@flask_app.route("/api/status")
-def status_json():
-    return ping_json()
-
-
 # ============ SELF-PING ============
 def keep_alive():
     if not WEBAPP_URL:
@@ -964,7 +1006,14 @@ def run_flask():
 
 # ============ MAIN ============
 if __name__ == "__main__":
-    threading.Thread(target=cleanup_old_sessions, daemon=True).start()
-    threading.Thread(target=keep_alive, daemon=True).start()
-    logger.info(f"Web server khởi động tại port {PORT}")
+    # 1. Khởi động event loop TRƯỚC KHI có bất kỳ request nào
+    async_manager.start()
+
+    # 2. Khởi động thread dọn session
+    threading.Thread(target=cleanup_old_sessions, daemon=True, name="SessionCleanup").start()
+
+    # 3. Khởi động self-ping
+    threading.Thread(target=keep_alive, daemon=True, name="KeepAlive").start()
+
+    logger.info(f"🚀 Web server khởi động tại port {PORT}")
     run_flask()
