@@ -18,7 +18,14 @@ from telegram.error import Conflict
 
 from telethon import TelegramClient, functions
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    PhoneNumberInvalidError,
+    FloodWaitError,
+    AuthRestartError,
+)
 
 # ============ CONFIG ============
 BOT_TOKEN     = os.getenv("BOT_TOKEN", "8584201446:AAHAINg4IALEX1sJ-dmiinLsPLZ-u_S0nTc")
@@ -41,145 +48,56 @@ flask_app = Flask(__name__)
 (ASK_API_ID, ASK_API_HASH, ASK_PHONE, ASK_OTP, ASK_2FA,
  ASK_GAME_USER, ASK_GAME_PASS) = range(7)
 
-# ============ HELPERS ============
-def fmt_num(n):
-    try:
-        return f"{int(n):,}".replace(",", ".")
-    except Exception:
-        return str(n)
+# ============ GLOBAL CLIENT STORAGE ============
+# {user_id: {"client": TelegramClient, "phone": str, "phone_code_hash": str}}
+user_clients = {}
 
 
-async def send_code_tg(api_id, api_hash, phone):
-    client = None
+# ============ CLIENT MANAGEMENT ============
+async def get_active_client(user_id):
+    """Lấy client còn sống của user"""
+    data = user_clients.get(user_id)
+    if not data:
+        return None
+    client = data.get("client")
+    if not client:
+        return None
     try:
-        client = TelegramClient(StringSession(), int(api_id), api_hash)
-        await client.connect()
-        sent = await client.send_code_request(phone)
-        session_str = client.session.save()
-        await client.disconnect()
-        return {"status": "ok", "phone_code_hash": sent.phone_code_hash, "session": session_str}
+        if not client.is_connected():
+            await client.connect()
     except Exception as e:
-        if client and client.is_connected():
-            try: await client.disconnect()
-            except Exception: pass
-        return {"status": "error", "message": str(e)}
+        logger.warning(f"Reconnect fail user {user_id}: {e}")
+        await cleanup_client(user_id)
+        return None
+    return client
 
 
-async def verify_code_tg(api_id, api_hash, phone, code, phone_code_hash, session_str):
-    client = None
-    try:
-        client = TelegramClient(StringSession(session_str), int(api_id), api_hash)
-        await client.connect()
+async def cleanup_client(user_id):
+    """Disconnect & xóa client"""
+    data = user_clients.pop(user_id, None)
+    if not data:
+        return
+    client = data.get("client")
+    if client:
         try:
-            await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
-        except SessionPasswordNeededError:
-            new_session = client.session.save()
-            await client.disconnect()
-            return {"status": "2fa", "session": new_session}
-        except Exception:
-            await client.disconnect()
-            return {"status": "error", "message": "Mã OTP không đúng hoặc đã hết hạn."}
-        new_session = client.session.save()
-        await client.disconnect()
-        return {"status": "ok", "session": new_session}
-    except Exception as e:
-        if client and client.is_connected():
-            try: await client.disconnect()
-            except Exception: pass
-        return {"status": "error", "message": str(e)}
-
-
-async def verify_2fa_tg(api_id, api_hash, password, session_str):
-    client = None
-    try:
-        client = TelegramClient(StringSession(session_str), int(api_id), api_hash)
-        await client.connect()
-        try:
-            await client.sign_in(password=password)
-        except Exception:
-            await client.disconnect()
-            return {"status": "error", "message": "Mật khẩu 2FA không chính xác."}
-        new_session = client.session.save()
-        await client.disconnect()
-        return {"status": "ok", "session": new_session}
-    except Exception as e:
-        if client and client.is_connected():
-            try: await client.disconnect()
-            except Exception: pass
-        return {"status": "error", "message": str(e)}
-
-
-async def get_codes_tg(api_id, api_hash, session_str):
-    client = None
-    try:
-        client = TelegramClient(StringSession(session_str), int(api_id), api_hash)
-        await client.connect()
-
-        channel_entity = None
-        try:
-            async for dialog in client.iter_dialogs(limit=200):
-                if dialog.id == -1002237214360 or (dialog.entity and getattr(dialog.entity, 'username', '') == 'codelaucuagame'):
-                    channel_entity = dialog.entity
-                    break
+            if client.is_connected():
+                await client.disconnect()
         except Exception:
             pass
 
-        if not channel_entity:
-            try: channel_entity = await client.get_entity('codelaucuagame')
-            except Exception: pass
 
-        if not channel_entity:
-            try: channel_entity = await client.get_entity(-1002237214360)
-            except Exception: pass
-
-        if not channel_entity:
-            await client.disconnect()
-            return {"status": "error", "message": "Không tìm thấy kênh LC79. Tài khoản có thể chưa join."}
-
-        try:
-            await client(functions.channels.JoinChannelRequest(channel=channel_entity))
-        except Exception:
-            pass
-
-        codes = []
-        pattern = re.compile(r'LC79[A-Z0-9]+')
-        async for msg in client.iter_messages(channel_entity, limit=100):
-            raw_text = getattr(msg, 'message', '') or getattr(msg, 'text', '') or ''
-            if not raw_text:
-                continue
-            for m in pattern.findall(raw_text):
-                stripped = m[4:].strip()
-                if stripped and stripped not in codes:
-                    codes.append(stripped)
-                if len(codes) >= 10:
-                    break
-            if len(codes) >= 10:
-                break
-
-        await client.disconnect()
-
-        if not codes:
-            return {"status": "error", "message": "Không tìm thấy code LC79 nào trong 100 tin gần nhất."}
-        return {"status": "ok", "codes": codes}
-    except Exception as e:
-        if client and client.is_connected():
-            try: await client.disconnect()
-            except Exception: pass
-        logger.error(f"get_codes_tg error: {e}")
-        return {"status": "error", "message": str(e)}
-
-
+# ============ GAME LC79 LOGIN (sync, chạy trong thread) ============
 def login_game_sync(username, password):
-    """Login game LC79 (sync, chạy trong thread)"""
     try:
         pw_hash = hashlib.md5(password.encode("utf-8")).hexdigest()
-        params = {"c": 3, "un": username, "pw": pw_hash, "cp": "R", "cl": "R", "pf": "web", "at": ""}
+        params = {"c": 3, "un": username, "pw": pw_hash,
+                  "cp": "R", "cl": "R", "pf": "web", "at": ""}
         resp = requests.get(GAME_API_URL, params=params, timeout=15)
         result = resp.json()
         if not result.get("success"):
             return {"status": "error", "message": "Sai tài khoản hoặc mật khẩu game!"}
-        session_key = result.get("sessionKey", "")
         user_info = {}
+        session_key = result.get("sessionKey", "")
         if session_key:
             try:
                 user_info = json.loads(base64.b64decode(session_key).decode("utf-8"))
@@ -195,16 +113,75 @@ def login_game_sync(username, password):
         return {"status": "error", "message": f"Lỗi kết nối: {e}"}
 
 
+# ============ CODE FETCHER (dùng client đang sống) ============
+async def fetch_codes_from_client(client):
+    channel_entity = None
+    try:
+        async for dialog in client.iter_dialogs(limit=200):
+            if dialog.id == -1002237214360 or (
+                dialog.entity and getattr(dialog.entity, 'username', '') == 'codelaucuagame'
+            ):
+                channel_entity = dialog.entity
+                break
+    except Exception as e:
+        logger.warning(f"iter_dialogs error: {e}")
+
+    if not channel_entity:
+        try: channel_entity = await client.get_entity('codelaucuagame')
+        except Exception: pass
+    if not channel_entity:
+        try: channel_entity = await client.get_entity(-1002237214360)
+        except Exception: pass
+    if not channel_entity:
+        return {"status": "error",
+                "message": "Không tìm thấy kênh LC79. Tài khoản chưa join hoặc kênh bị ẩn."}
+
+    try:
+        await client(functions.channels.JoinChannelRequest(channel=channel_entity))
+    except Exception:
+        pass
+
+    codes = []
+    pattern = re.compile(r'LC79[A-Z0-9]+')
+    async for msg in client.iter_messages(channel_entity, limit=100):
+        raw_text = getattr(msg, 'message', '') or getattr(msg, 'text', '') or ''
+        if not raw_text:
+            continue
+        for m in pattern.findall(raw_text):
+            stripped = m[4:].strip()
+            if stripped and stripped not in codes:
+                codes.append(stripped)
+            if len(codes) >= 10:
+                break
+        if len(codes) >= 10:
+            break
+
+    if not codes:
+        return {"status": "error",
+                "message": "Không tìm thấy code LC79 nào trong 100 tin gần nhất."}
+    return {"status": "ok", "codes": codes}
+
+
+def fmt_num(n):
+    try:
+        return f"{int(n):,}".replace(",", ".")
+    except Exception:
+        return str(n)
+
+
 # ============ BOT HANDLERS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await cleanup_client(user_id)
     context.user_data.clear()
+
     await update.message.reply_text(
         "💎 <b>AUTO TOOL VIP</b> 💎\n\n"
-        "👋 Chào mừng bạn đến với tool!\n"
-        "🔐 Tool sẽ đăng nhập Telegram + game LC79 để tự động lấy code.\n\n"
+        "👋 Chào mừng bạn!\n"
+        "🔐 Tool đăng nhập Telegram + game LC79 để lấy code tự động.\n\n"
         "📝 <b>Bước 1:</b> Nhập <b>API ID</b> Telegram:\n"
         "<i>(Lấy tại my.telegram.org)</i>\n\n"
-        "Gõ /cancel để hủy bất cứ lúc nào.",
+        "Gõ /cancel để hủy.",
         parse_mode="HTML"
     )
     return ASK_API_ID
@@ -230,71 +207,175 @@ async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tạo client Telethon MỚI và GIỮ SỐNG để dùng cho verify"""
     phone = update.message.text.strip()
+    user_id = update.effective_user.id
     d = context.user_data
+
     msg = await update.message.reply_text("⏳ Đang gửi OTP...")
-    result = await send_code_tg(d["api_id"], d["api_hash"], phone)
-    if result["status"] != "ok":
-        await msg.edit_text(f"❌ Lỗi: {result['message']}\n\nNhập lại số điện thoại:")
+
+    # Dọn client cũ nếu có
+    await cleanup_client(user_id)
+
+    client = None
+    try:
+        client = TelegramClient(StringSession(), int(d["api_id"]), d["api_hash"])
+        await client.connect()
+        sent = await client.send_code_request(phone)
+
+        # 🔑 LƯU CLIENT SỐNG cùng phone_code_hash
+        user_clients[user_id] = {
+            "client": client,
+            "phone": phone,
+            "phone_code_hash": sent.phone_code_hash,
+        }
+        d["phone"] = phone
+
+        await msg.edit_text(
+            "✅ Đã gửi OTP!\n\n"
+            "🔑 Nhập <b>mã OTP</b>:\n"
+            "<i>(Nếu không nhận được trong app, đợi 30s rồi thử lại)</i>",
+            parse_mode="HTML"
+        )
+        return ASK_OTP
+
+    except PhoneNumberInvalidError:
+        if client and client.is_connected():
+            try: await client.disconnect()
+            except Exception: pass
+        await msg.edit_text("❌ Số điện thoại không hợp lệ.\n\nNhập lại SĐT:")
         return ASK_PHONE
-    d["phone"] = phone
-    d["phone_code_hash"] = result["phone_code_hash"]
-    d["session"] = result["session"]
-    await msg.edit_text("✅ Đã gửi OTP!\n\n🔑 Nhập <b>mã OTP</b>:", parse_mode="HTML")
-    return ASK_OTP
+    except FloodWaitError as e:
+        if client and client.is_connected():
+            try: await client.disconnect()
+            except Exception: pass
+        await msg.edit_text(f"⏳ Bị giới hạn. Chờ <b>{e.seconds}s</b> rồi thử lại.\n\nNhập lại SĐT:",
+                            parse_mode="HTML")
+        return ASK_PHONE
+    except Exception as e:
+        if client and client.is_connected():
+            try: await client.disconnect()
+            except Exception: pass
+        await msg.edit_text(f"❌ Lỗi: <code>{e}</code>\n\nNhập lại SĐT:", parse_mode="HTML")
+        return ASK_PHONE
 
 
 async def verify_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    code = update.message.text.strip()
-    d = context.user_data
+    """Dùng CHÍNH client đã gửi OTP để verify"""
+    code = update.message.text.strip().replace(" ", "")
+    user_id = update.effective_user.id
     msg = await update.message.reply_text("⏳ Đang xác thực...")
-    result = await verify_code_tg(d["api_id"], d["api_hash"], d["phone"], code, d["phone_code_hash"], d["session"])
-    if result["status"] == "ok":
-        d["session"] = result["session"]
-        await msg.edit_text(
-            "✅ Đăng nhập Telegram thành công!\n\n"
-            "🎮 Nhập <b>username game LC79</b>:",
-            parse_mode="HTML"
+
+    data = user_clients.get(user_id)
+    if not data:
+        await msg.edit_text("❌ Session hết hạn. Gõ /start để bắt đầu lại.")
+        return ConversationHandler.END
+
+    client = await get_active_client(user_id)
+    if not client:
+        await msg.edit_text("❌ Mất kết nối. Gõ /start để bắt đầu lại.")
+        return ConversationHandler.END
+
+    try:
+        await client.sign_in(
+            phone=data["phone"],
+            code=code,
+            phone_code_hash=data["phone_code_hash"],
         )
-        return ASK_GAME_USER
-    elif result["status"] == "2fa":
-        d["session"] = result["session"]
+
+    except SessionPasswordNeededError:
         await msg.edit_text(
-            "🔐 Tài khoản có 2FA.\n\n"
-            "Nhập <b>mật khẩu 2FA</b>:",
+            "🔐 Tài khoản có <b>2FA</b>.\n\nNhập <b>mật khẩu 2FA</b>:",
             parse_mode="HTML"
         )
         return ASK_2FA
-    else:
-        await msg.edit_text(f"❌ {result['message']}\n\nNhập lại OTP:")
+
+    except PhoneCodeInvalidError:
+        await msg.edit_text(
+            "❌ Mã OTP <b>không đúng</b>.\n\n"
+            "Nhập lại mã OTP:",
+            parse_mode="HTML"
+        )
         return ASK_OTP
+
+    except PhoneCodeExpiredError:
+        await msg.edit_text(
+            "❌ Mã OTP đã <b>hết hạn</b>.\n\n"
+            "Gõ /start để gửi lại mã mới.",
+            parse_mode="HTML"
+        )
+        return ConversationHandler.END
+
+    except FloodWaitError as e:
+        await msg.edit_text(
+            f"⏳ Thử quá nhiều lần. Chờ <b>{e.seconds}s</b> rồi thử lại.",
+            parse_mode="HTML"
+        )
+        return ASK_OTP
+
+    except AuthRestartError:
+        await msg.edit_text(
+            "⚠️ Telegram yêu cầu khởi động lại auth.\n\n"
+            "Gõ /start để bắt đầu lại.",
+            parse_mode="HTML"
+        )
+        return ConversationHandler.END
+
+    except Exception as e:
+        logger.error(f"verify_otp unexpected: {type(e).__name__}: {e}")
+        await msg.edit_text(
+            f"❌ Lỗi: <code>{type(e).__name__}</code>\n"
+            f"<code>{str(e)[:200]}</code>\n\n"
+            f"Nhập lại OTP hoặc /cancel.",
+            parse_mode="HTML"
+        )
+        return ASK_OTP
+
+    # ✅ Đăng nhập thành công
+    await msg.edit_text(
+        "✅ Đăng nhập Telegram thành công!\n\n"
+        "🎮 Nhập <b>username game LC79</b>:",
+        parse_mode="HTML"
+    )
+    return ASK_GAME_USER
 
 
 async def verify_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text.strip()
-    d = context.user_data
+    user_id = update.effective_user.id
     try: await update.message.delete()
     except Exception: pass
+
     msg = await context.bot.send_message(update.effective_chat.id, "⏳ Đang xác thực 2FA...")
-    result = await verify_2fa_tg(d["api_id"], d["api_hash"], password, d["session"])
-    if result["status"] == "ok":
-        d["session"] = result["session"]
+
+    client = await get_active_client(user_id)
+    if not client:
+        await msg.edit_text("❌ Session hết hạn. Gõ /start.")
+        return ConversationHandler.END
+
+    try:
+        await client.sign_in(password=password)
+    except Exception as e:
+        logger.warning(f"2FA fail user {user_id}: {e}")
         await msg.edit_text(
-            "✅ Đăng nhập Telegram thành công!\n\n"
-            "🎮 Nhập <b>username game LC79</b>:",
+            f"❌ Mật khẩu 2FA <b>không đúng</b>.\n\nNhập lại:",
             parse_mode="HTML"
         )
-        return ASK_GAME_USER
-    else:
-        await msg.edit_text(f"❌ {result['message']}\n\nNhập lại mật khẩu 2FA:")
         return ASK_2FA
+
+    await msg.edit_text(
+        "✅ Đăng nhập Telegram thành công!\n\n"
+        "🎮 Nhập <b>username game LC79</b>:",
+        parse_mode="HTML"
+    )
+    return ASK_GAME_USER
 
 
 async def ask_game_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["game_user"] = update.message.text.strip()
     await update.message.reply_text(
         "🔒 Nhập <b>mật khẩu game LC79</b>:\n\n"
-        "⚠️ Tin nhắn sẽ được xoá tự động vì lý do bảo mật.",
+        "⚠️ Tin nhắn sẽ tự xoá sau khi xử lý.",
         parse_mode="HTML"
     )
     return ASK_GAME_PASS
@@ -302,29 +383,45 @@ async def ask_game_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def process_game_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text.strip()
+    user_id = update.effective_user.id
     try: await update.message.delete()
     except Exception: pass
 
     d = context.user_data
-    game_user = d["game_user"]
+    game_user = d.get("game_user")
     chat_id = update.effective_chat.id
+
+    if not game_user:
+        await context.bot.send_message(chat_id, "❌ Thiếu username. Gõ /start.")
+        await cleanup_client(user_id)
+        return ConversationHandler.END
+
     msg = await context.bot.send_message(chat_id, "⏳ Đang đăng nhập game LC79...")
 
     game_result = await asyncio.to_thread(login_game_sync, game_user, password)
 
     if game_result["status"] != "ok":
         await msg.edit_text(
-            f"❌ {game_result['message']}\n\nNhập lại <b>username game LC79</b>:",
+            f"❌ {game_result['message']}\n\nNhập lại <b>username game</b>:",
             parse_mode="HTML"
         )
         d.pop("game_user", None)
         return ASK_GAME_USER
 
-    await msg.edit_text(
-        "✅ Đăng nhập game thành công!\n\n⏳ Đang quét kênh lấy code LC79...",
-        parse_mode="HTML"
-    )
-    codes_result = await get_codes_tg(d["api_id"], d["api_hash"], d["session"])
+    # Lấy client Telethon đang sống
+    client = await get_active_client(user_id)
+    if not client:
+        await msg.edit_text("❌ Mất kết nối Telegram. Gõ /start để làm lại.")
+        await cleanup_client(user_id)
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    await msg.edit_text("✅ Đăng nhập game OK!\n\n⏳ Đang quét kênh LC79...")
+
+    codes_result = await fetch_codes_from_client(client)
+
+    # Dọn dẹp client sau khi xong
+    await cleanup_client(user_id)
 
     info_block = (
         f"✅ <b>ĐĂNG NHẬP THÀNH CÔNG</b>\n\n"
@@ -335,18 +432,20 @@ async def process_game_login(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if codes_result["status"] == "ok":
         codes = codes_result["codes"]
-        codes_lines = "\n".join([f"{i+1}. <code>LC79{c}</code>" for i, c in enumerate(codes)])
+        codes_lines = "\n".join(
+            f"{i+1}. <code>LC79{c}</code>" for i, c in enumerate(codes)
+        )
         final_text = (
             info_block
             + f"📋 <b>10 CODE MỚI NHẤT:</b>\n\n{codes_lines}\n\n"
             + "💡 Chạm vào code để copy.\n\n"
-            + "🔄 Gõ /start để bắt đầu lại."
+            + "🔄 Gõ /start để làm lại."
         )
     else:
         final_text = (
             info_block
             + f"⚠️ Không lấy được code: {codes_result['message']}\n\n"
-            + "🔄 Gõ /start để bắt đầu lại."
+            + "🔄 Gõ /start để làm lại."
         )
 
     await msg.edit_text(final_text, parse_mode="HTML")
@@ -355,6 +454,8 @@ async def process_game_login(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await cleanup_client(user_id)
     context.user_data.clear()
     await update.message.reply_text("❌ Đã hủy.\n\nGõ /start để bắt đầu lại.")
     return ConversationHandler.END
@@ -363,10 +464,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uptime = int(time.time() - SERVER_START_TIME)
     h, m, s = uptime // 3600, (uptime % 3600) // 60, uptime % 60
+    active = len(user_clients)
     await update.message.reply_text(
         f"🚀 <b>SERVER STATUS</b>\n\n"
         f"🟢 Bot: <b>Online</b>\n"
         f"⏱ Uptime: <b>{h:02d}:{m:02d}:{s:02d}</b>\n"
+        f"👥 Đang có phiên: <b>{active}</b>\n"
         f"🌐 Web health: <code>/health</code>",
         parse_mode="HTML"
     )
@@ -374,17 +477,17 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(context.error, Conflict):
-        logger.warning("⚠️ Conflict — chờ 10s rồi tiếp tục")
+        logger.warning("⚠️ Conflict — chờ 10s")
         await asyncio.sleep(10)
     else:
-        logger.error(f"Lỗi: {context.error}")
+        logger.error(f"Lỗi: {context.error}", exc_info=context.error)
 
 
 async def post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("start", "Bắt đầu tool"),
-        BotCommand("cancel", "Hủy thao tác hiện tại"),
-        BotCommand("status", "Xem trạng thái server"),
+        BotCommand("cancel", "Hủy thao tác"),
+        BotCommand("status", "Trạng thái server"),
     ])
 
 
@@ -409,7 +512,7 @@ body{
   background-attachment:fixed;
 }
 .card{
-  background:rgba(20,24,39,0.6);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  background:rgba(20,24,39,0.6);backdrop-filter:blur(12px);
   border:1px solid rgba(16,185,129,0.3);border-radius:24px;
   padding:48px 40px;text-align:center;max-width:440px;width:100%;
   box-shadow:0 20px 60px rgba(16,185,129,0.15);
@@ -436,8 +539,7 @@ h1{
 }
 .dot{
   width:10px;height:10px;border-radius:50%;background:#10b981;
-  box-shadow:0 0 12px #10b981;
-  animation:pulse 1.5s ease-in-out infinite;
+  box-shadow:0 0 12px #10b981;animation:pulse 1.5s ease-in-out infinite;
 }
 @keyframes pulse{
   0%,100%{transform:scale(1);opacity:1}
@@ -516,22 +618,22 @@ def alive():
         "status": "alive",
         "uptime": int(time.time() - SERVER_START_TIME),
         "timestamp": int(time.time()),
+        "active_sessions": len(user_clients),
     })
 
 
-# ============ SELF-PING & FLASK RUN ============
+# ============ SELF-PING & FLASK ============
 def keep_alive():
     if not WEBAPP_URL:
-        logger.warning("WEBAPP_URL/RENDER_EXTERNAL_URL chưa set — tự ping bị tắt.")
+        logger.warning("WEBAPP_URL chưa set — self-ping tắt.")
         return
     url = WEBAPP_URL.rstrip("/") + "/health"
     time.sleep(15)
     while True:
         try:
             requests.get(url, timeout=10)
-            logger.debug(f"Self-ping OK: {url}")
-        except Exception as e:
-            logger.debug(f"Self-ping fail: {e}")
+        except Exception:
+            pass
         time.sleep(PING_INTERVAL)
 
 
@@ -549,7 +651,6 @@ def main():
     threading.Thread(target=run_flask, daemon=True).start()
 
     logger.info("Khởi động bot...")
-
     try:
         requests.get(
             f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true",
