@@ -43,17 +43,25 @@ logger = logging.getLogger("AutoTool")
 flask_app = Flask(__name__)
 
 # ================================================================
-#                LC79 ACCOUNT — NHẬN MD5 TRỰC TIẾP
+#                LC79 ACCOUNT — MD5 + INFO DECODE
 # ================================================================
 def normalize_pw(pw_input: str) -> str:
-    """
-    - Nếu input là 32 ký tự hex → coi là MD5 có sẵn (dùng luôn)
-    - Ngược lại → MD5 hash của password thô
-    """
+    """32 ký tự hex → MD5 có sẵn. Ngược lại → md5(pw)."""
     pw = pw_input.strip()
     if len(pw) == 32 and all(c in "0123456789abcdefABCDEF" for c in pw):
         return pw.lower()
     return hashlib.md5(pw.encode("utf-8")).hexdigest()
+
+
+def decode_session_key(sk: str) -> dict:
+    """Decode base64 sessionKey → dict info account"""
+    try:
+        sk += "=" * (-len(sk) % 4)
+        raw = base64.b64decode(sk).decode("utf-8")
+        return json.loads(raw)
+    except Exception as e:
+        logger.warning(f"decode_session_key fail: {e}")
+        return {}
 
 
 class LC79Account:
@@ -65,14 +73,16 @@ class LC79Account:
         self.jwt_exp = 0
         self.lock = threading.Lock()
         self.redeemed = set()
+        self.info = {}       # dict từ sessionKey decode
+        self.cur_level = None
+        self.level_ratio = []
         self.last_error = None
 
     def configure(self, username: str, pw_input: str, nickname: str = None):
-        """pw_input: MD5 có sẵn HOẶC password thô (tự detect)"""
         self.un = username.strip()
         self.pw_md5 = normalize_pw(pw_input)
         self.nick = (nickname or username).strip()
-        logger.info(f"[LC79] Config OK | un={self.un} | nick={self.nick} | md5={self.pw_md5[:8]}...")
+        logger.info(f"[LC79] Config | un={self.un} | nick={self.nick} | md5={self.pw_md5[:8]}...")
 
     @staticmethod
     def parse_jwt_exp(token: str) -> int:
@@ -116,7 +126,7 @@ class LC79Account:
             return None
 
     def refresh_token_detailed(self):
-        """Trả về (success: bool, error_msg: str or None)"""
+        """Trả về (success, error_msg). Tự lưu info từ sessionKey."""
         access = self.get_access_token()
         if not access:
             return False, "Sai TÀI KHOẢN hoặc MD5 MẬT KHẨU (get_access_token fail)"
@@ -135,13 +145,31 @@ class LC79Account:
                              timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             data = res.json()
             token = data.get("token")
+
             if token:
                 self.jwt = token
                 self.jwt_exp = self.parse_jwt_exp(token)
+
+                # ===== DECODE INFO TỪ sessionKey =====
+                sk = data.get("sessionKey")
+                if sk:
+                    info = decode_session_key(sk)
+                    info["curLevel"] = data.get("curLevel")
+                    info["levelRatio"] = data.get("levelRatio", [])
+                    info["accessToken"] = data.get("accessToken")
+                    info["timer"] = data.get("timer", 0)
+                    self.info = info
+                    self.cur_level = data.get("curLevel")
+                    self.level_ratio = data.get("levelRatio", [])
+                    logger.info(f"[LC79] Info decoded: nick={info.get('nickname')}, "
+                                f"vip={info.get('vipTotal')}, xu={info.get('xuTotal')}, "
+                                f"lv={info.get('curLevel')}")
+
                 remain = int((self.jwt_exp - time.time()) / 60) if self.jwt_exp else 0
                 logger.info(f"[LC79] ✅ JWT OK (còn {remain} phút)")
                 return True, None
-            return False, f"get_access_token OK nhưng LOGIN FAIL → kiểm tra NICKNAME. Phản hồi: {data}"
+
+            return False, f"Login OK nhưng trả về không có token → kiểm tra NICKNAME. Phản hồi: {data}"
         except Exception as e:
             return False, f"Lỗi kết nối login: {e}"
 
@@ -202,8 +230,9 @@ class LC79Account:
         except Exception as e:
             return {"status": "fail", "message": str(e)[:40]}
 
+
 # ================================================================
-#                    GLOBAL STATE (1 USER)
+#                    GLOBAL STATE (1 USER, 1 CODE)
 # ================================================================
 class AppState:
     def __init__(self):
@@ -211,7 +240,7 @@ class AppState:
         self.api_id = None
         self.api_hash = None
         self.phone = None
-        self.recent_codes = []
+        self.latest_code = None     # CHỈ 1 CODE DUY NHẤT
         self.listener_started = False
         self.lock = threading.Lock()
         self.lc79 = LC79Account()
@@ -222,45 +251,42 @@ state = AppState()
 def _bump_version():
     state.version += 1
 
-def add_recent_code(code, status="pending", message=""):
+def set_latest_code(code, status="pending", message=""):
+    """Chỉ giữ 1 code duy nhất. Trả về True nếu là code MỚI."""
     with state.lock:
-        for c in state.recent_codes:
-            if c["code"] == code:
-                return False
-        state.recent_codes.insert(0, {
+        if state.latest_code and state.latest_code.get("code") == code:
+            return False
+        state.latest_code = {
             "code": code, "ts": time.time(),
             "status": status, "message": message,
-        })
-        if len(state.recent_codes) > 10:
-            state.recent_codes = state.recent_codes[:10]
+        }
         _bump_version()
     return True
 
-def update_code_status(code, status, message):
+def update_latest_status(code, status, message):
     with state.lock:
-        for c in state.recent_codes:
-            if c["code"] == code:
-                c["status"] = status
-                c["message"] = message
-                _bump_version()
-                return
+        if state.latest_code and state.latest_code.get("code") == code:
+            state.latest_code["status"] = status
+            state.latest_code["message"] = message
+            _bump_version()
 
 def auto_redeem(code):
     if not state.lc79.un:
-        update_code_status(code, "pending", "Chưa login LC79")
+        update_latest_status(code, "pending", "Chưa login LC79")
         return
     result = state.lc79.redeem(code)
-    update_code_status(code, result["status"], result["message"])
+    update_latest_status(code, result["status"], result["message"])
     logger.info(f"[REDEEM] {code} → {result['status']} ({result['message']})")
 
 def add_and_redeem(code):
-    if not add_recent_code(code, "pending", "Đang nhập..."):
+    if not set_latest_code(code, "pending", "Đang nhập..."):
         return
-    logger.info(f"🆕 Code mới: {code}")
+    logger.info(f"🆕 Code mới: {code} → redeem ngay")
     threading.Thread(target=auto_redeem, args=(code,), daemon=True).start()
 
+
 # ================================================================
-#                    TELETHON LISTENER (REAL-TIME)
+#                    TELETHON LISTENER (REAL-TIME 0.1s)
 # ================================================================
 async def telethon_listener_main():
     try:
@@ -292,22 +318,23 @@ async def telethon_listener_main():
         except Exception:
             pass
 
-        # Scan 100 tin gần nhất — load lên UI nhưng KHÔNG auto redeem
-        logger.info("📡 Scan 100 tin gần nhất...")
-        seen = set()
-        async for msg in client.iter_messages(channel, limit=100):
+        # Scan 1 tin gần nhất có code (không auto redeem)
+        logger.info("📡 Scan tin gần nhất...")
+        async for msg in client.iter_messages(channel, limit=20):
             text = getattr(msg, "message", "") or ""
-            for full in re.findall(r"LC79[A-Z0-9]+", text):
-                code = full[4:].strip()
-                if code and code not in seen:
-                    seen.add(code)
-                    add_recent_code(code, "pending", "Chưa nhập")
+            m = re.findall(r"LC79[A-Z0-9]+", text)
+            if m:
+                code = m[0][4:].strip()
+                if code:
+                    set_latest_code(code, "pending", "Chưa nhập (code cũ)")
+                    logger.info(f"📌 Code gần nhất: {code}")
+                break
 
-        logger.info(f"✅ Load {len(seen)} code cũ | Listener ON")
+        logger.info("✅ Listener ON — Chờ code mới...")
         state.listener_started = True
         _bump_version()
 
-        # ⚡ EVENT HANDLER — bắt tin mới tức thì (< 50ms)
+        # ⚡ EVENT HANDLER — bắt tin mới NGAY LẬP TỨC
         @client.on(events.NewMessage(chats=channel))
         async def on_new(event):
             text = event.raw_text or ""
@@ -332,6 +359,7 @@ def start_listener():
         return False
     threading.Thread(target=_run_listener_loop, daemon=True).start()
     return True
+
 
 # ================================================================
 #                    FLASK API
@@ -401,7 +429,6 @@ def api_verify_2fa():
 
 @flask_app.route("/api/lc79_login", methods=["POST"])
 def api_lc79_login():
-    """Đăng nhập LC79 + lưu session Telegram + khởi động listener"""
     d = request.json or {}
     username = (d.get("username") or "").strip()
     pw_input = (d.get("password") or "").strip()
@@ -410,53 +437,57 @@ def api_lc79_login():
     if not username or not pw_input:
         return jsonify({"status": "error", "message": "Nhập đủ TÀI KHOẢN + MẬT KHẨU (MD5)."})
 
-    # Cấu hình LC79 (nhận MD5 trực tiếp HOẶC password thô)
     state.lc79.configure(username, pw_input, nickname)
 
-    # Refresh token — trả lỗi chi tiết
     ok, err = state.lc79.refresh_token_detailed()
     if not ok:
         return jsonify({"status": "error", "message": err})
 
-    # Lưu Telegram session
     state.session_str = d.get("session")
     state.api_id = int(d["api_id"]) if d.get("api_id") else None
     state.api_hash = d.get("api_hash")
     state.phone = d.get("phone")
 
     if not state.session_str:
-        return jsonify({"status": "error", "message": "Thiếu session Telegram — thử đăng nhập lại Telegram."})
+        return jsonify({"status": "error", "message": "Thiếu session Telegram."})
 
-    # Khởi động listener real-time
     start_listener()
-
-    return jsonify({"status": "ok", "message": "Đăng nhập thành công!"})
+    return jsonify({"status": "ok", "message": "Đăng nhập thành công!", "info": state.lc79.info})
 
 @flask_app.route("/api/get_codes", methods=["POST"])
 def api_get_codes():
+    """Trả 1 code + info account. Polling 100ms từ client."""
     with state.lock:
-        codes = [dict(c) for c in state.recent_codes]
+        code = dict(state.latest_code) if state.latest_code else None
     return jsonify({
         "status": "ok",
-        "codes": codes,
+        "code": code,
         "listener": state.listener_started,
         "lc79": state.lc79.is_token_valid() if state.lc79.un else False,
         "version": state.version,
+        "info": state.lc79.info,
+        "nickname": state.lc79.nick,
+        "curLevel": state.lc79.cur_level,
+        "levelRatio": state.lc79.level_ratio,
     })
 
 @flask_app.route("/api/redeem", methods=["POST"])
 def api_redeem():
     code = (request.json.get("code") or "").strip()
     if not code:
-        return jsonify({"status": "error", "message": "Missing code"})
+        return jsonify({"status": "error", "message": "Thiếu code"})
     if not state.lc79.un:
         return jsonify({"status": "error", "message": "Chưa login LC79"})
+
+    # Nếu trùng code mới nhất → update status
+    set_latest_code(code, "pending", "Đang nhập...")
     threading.Thread(target=auto_redeem, args=(code,), daemon=True).start()
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "message": f"Đang nhập {code}..."})
 
 @flask_app.route("/health")
 def health():
     return Response("ok", mimetype="text/plain")
+
 
 # ================================================================
 #                    MINI APP HTML — WHITE THEME
@@ -489,29 +520,16 @@ body{
 .view{display:none;animation:in .28s ease}
 .view.active{display:block}
 @keyframes in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-
 .icon{width:22px;height:22px;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round;fill:none}
 .icon-sm{width:16px;height:16px}
 .icon-lg{width:28px;height:28px}
 
 .hero{padding:22px 0 18px;text-align:center}
-.logo{
-  display:inline-flex;align-items:center;justify-content:center;
-  width:64px;height:64px;border-radius:20px;
-  background:linear-gradient(135deg,#6366f1,#8b5cf6);
-  color:#fff;margin-bottom:14px;
-  box-shadow:0 8px 24px rgba(99,102,241,.3);
-}
+.logo{display:inline-flex;align-items:center;justify-content:center;width:64px;height:64px;border-radius:20px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;margin-bottom:14px;box-shadow:0 8px 24px rgba(99,102,241,.3)}
 .hero h1{font-size:22px;font-weight:800;letter-spacing:-.5px;margin-bottom:6px}
 .hero p{color:var(--muted);font-size:13px;font-weight:500}
 
-.card{
-  background:#fff;border:1.5px solid var(--border);
-  border-radius:16px;padding:16px;
-  display:flex;align-items:center;gap:14px;
-  cursor:pointer;transition:.2s;
-  box-shadow:0 1px 3px rgba(0,0,0,.02);
-}
+.card{background:#fff;border:1.5px solid var(--border);border-radius:16px;padding:16px;display:flex;align-items:center;gap:14px;cursor:pointer;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.02)}
 .card:active{transform:scale(.98);border-color:var(--accent)}
 .card .ic{color:var(--accent);background:var(--accent-bg);width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
 .card .info{flex:1}
@@ -523,81 +541,97 @@ body{
 .back{display:inline-flex;align-items:center;gap:6px;background:var(--bg-alt);border:1px solid var(--border);color:var(--text);padding:8px 14px;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;margin-bottom:16px}
 .back:active{transform:scale(.95)}
 
-.panel{background:#fff;border:1.5px solid var(--border);border-radius:18px;padding:20px 18px}
+.panel{background:#fff;border:1.5px solid var(--border);border-radius:18px;padding:20px 18px;margin-bottom:14px}
 .panel .ttl{font-size:17px;font-weight:800;margin-bottom:4px}
 .panel .desc{font-size:12px;color:var(--muted);margin-bottom:18px;line-height:1.5}
 
 .field{margin-bottom:14px}
 .field label{display:block;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px}
-.field input{
-  width:100%;background:var(--bg-alt);border:1.5px solid var(--border);
-  border-radius:12px;padding:13px 14px;color:var(--text);
-  font-size:15px;font-weight:500;outline:none;transition:.2s;
-  font-family:inherit;
-}
+.field input{width:100%;background:var(--bg-alt);border:1.5px solid var(--border);border-radius:12px;padding:13px 14px;color:var(--text);font-size:15px;font-weight:500;outline:none;transition:.2s;font-family:inherit}
 .field input:focus{border-color:var(--accent);background:#fff;box-shadow:0 0 0 3px var(--accent-bg)}
 .field input::placeholder{color:#94a3b8;font-weight:400}
 .field .hint{font-size:11px;color:var(--muted);margin-top:5px;line-height:1.4}
-.field .hint code{background:var(--bg-alt);padding:1px 5px;border-radius:4px;font-size:10px;color:var(--accent);font-weight:600}
 
-.btn{
-  width:100%;padding:14px;border:none;border-radius:12px;
-  font-size:15px;font-weight:700;cursor:pointer;transition:.15s;
-  background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;
-  box-shadow:0 4px 14px rgba(99,102,241,.3);
-  display:flex;align-items:center;justify-content:center;gap:8px;
-}
+.btn{width:100%;padding:14px;border:none;border-radius:12px;font-size:15px;font-weight:700;cursor:pointer;transition:.15s;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;box-shadow:0 4px 14px rgba(99,102,241,.3);display:flex;align-items:center;justify-content:center;gap:8px}
 .btn:active{transform:scale(.97);box-shadow:none}
 .btn:disabled{opacity:.6;pointer-events:none}
 .btn.ghost{background:var(--bg-alt);color:var(--text);border:1.5px solid var(--border);box-shadow:none}
 
-.status-bar{
-  display:flex;align-items:center;gap:8px;
-  padding:10px 14px;border-radius:12px;
-  background:var(--bg-alt);border:1px solid var(--border);
-  font-size:12px;font-weight:600;color:var(--muted);
-  margin-bottom:14px;
-}
+/* STATUS */
+.status-bar{display:flex;align-items:center;gap:8px;padding:10px 14px;border-radius:12px;background:var(--bg-alt);border:1px solid var(--border);font-size:12px;font-weight:600;color:var(--muted);margin-bottom:14px}
 .status-bar .dot{width:8px;height:8px;border-radius:50%;background:#94a3b8;flex-shrink:0}
 .status-bar.on .dot{background:var(--success);box-shadow:0 0 0 3px rgba(5,150,105,.15);animation:pulse 1.4s infinite}
 .status-bar.on{color:var(--success);background:var(--success-bg);border-color:#a7f3d0}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
 
-.codes-wrap{
-  background:#fff;border:1.5px solid var(--border);
-  border-radius:16px;overflow:hidden;
+/* ACCOUNT INFO CARD */
+.acc-card{
+  background:linear-gradient(135deg,#6366f1 0%,#8b5cf6 100%);
+  color:#fff;border-radius:18px;padding:18px 16px;
+  margin-bottom:14px;position:relative;overflow:hidden;
+  box-shadow:0 8px 24px rgba(99,102,241,.28);
 }
-.codes-head{
-  padding:12px 16px;border-bottom:1px solid var(--border);
-  font-size:12px;font-weight:800;color:var(--muted);
-  text-transform:uppercase;letter-spacing:.6px;
-  display:flex;justify-content:space-between;align-items:center;
-  background:var(--bg-alt);
+.acc-card::before{
+  content:'';position:absolute;top:-40px;right:-40px;
+  width:140px;height:140px;border-radius:50%;
+  background:rgba(255,255,255,.12);
 }
-.codes-head .count{background:var(--accent-bg);color:var(--accent);padding:2px 8px;border-radius:6px;font-size:11px}
-
-.code-row{
-  display:flex;align-items:center;gap:10px;
-  padding:11px 14px;border-bottom:1px solid #f1f5f9;
-  font-size:13px;
-  animation:slideIn .3s ease;
+.acc-card::after{
+  content:'';position:absolute;bottom:-30px;left:-30px;
+  width:100px;height:100px;border-radius:50%;
+  background:rgba(255,255,255,.08);
 }
-.code-row:last-child{border-bottom:none}
-@keyframes slideIn{from{background:var(--accent-bg)}to{background:transparent}}
-.code-num{
-  width:22px;height:22px;flex-shrink:0;
+.acc-card>*{position:relative;z-index:1}
+.acc-top{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+.acc-avatar{
+  width:44px;height:44px;border-radius:14px;
+  background:rgba(255,255,255,.2);backdrop-filter:blur(10px);
   display:flex;align-items:center;justify-content:center;
-  background:var(--bg-alt);color:var(--muted);
-  font-size:10px;font-weight:800;border-radius:6px;
+  font-size:20px;font-weight:800;flex-shrink:0;
 }
-.code-val{flex:1;font-family:'SF Mono','Monaco',monospace;font-weight:700;font-size:13.5px;letter-spacing:.5px;color:var(--text);overflow:hidden;text-overflow:ellipsis}
-.code-status{font-size:10.5px;font-weight:700;padding:3px 8px;border-radius:6px;letter-spacing:.2px;flex-shrink:0;max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.code-status.success{background:var(--success-bg);color:var(--success)}
-.code-status.fail{background:var(--danger-bg);color:var(--danger)}
-.code-status.pending{background:var(--warn-bg);color:var(--warn)}
-.code-status.duplicate{background:#f1f5f9;color:var(--muted)}
+.acc-nick{font-size:16px;font-weight:800;letter-spacing:-.3px;line-height:1.2}
+.acc-lv{font-size:11px;opacity:.85;font-weight:600;margin-top:2px}
+.acc-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}
+.acc-stat{background:rgba(255,255,255,.15);border-radius:10px;padding:9px 8px;text-align:center;backdrop-filter:blur(10px)}
+.acc-stat .lbl{font-size:9.5px;opacity:.85;font-weight:700;letter-spacing:.4px;text-transform:uppercase}
+.acc-stat .val{font-size:14px;font-weight:800;margin-top:3px;letter-spacing:-.2px}
 
-.empty{padding:40px 20px;text-align:center;color:var(--muted);font-size:13px}
+.level-bar{height:6px;background:rgba(255,255,255,.2);border-radius:99px;margin-top:12px;overflow:hidden}
+.level-bar>div{height:100%;background:#fff;border-radius:99px;transition:width .4s ease}
+
+/* LATEST CODE BIG CARD */
+.code-big{
+  background:#fff;border:2px solid var(--border);
+  border-radius:18px;padding:18px 16px;
+  text-align:center;margin-bottom:14px;
+  transition:.3s;
+}
+.code-big.success{border-color:#a7f3d0;background:var(--success-bg)}
+.code-big.fail{border-color:#fecaca;background:var(--danger-bg)}
+.code-big.pending{border-color:#fde68a;background:var(--warn-bg)}
+
+.code-big .lbl{font-size:10.5px;font-weight:800;letter-spacing:1px;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+.code-big .val{
+  font-family:'SF Mono','Monaco',monospace;
+  font-size:26px;font-weight:900;letter-spacing:2px;
+  color:var(--text);margin-bottom:10px;
+  word-break:break-all;line-height:1.2;
+}
+.code-big.success .val{color:var(--success)}
+.code-big.fail .val{color:var(--danger)}
+.code-big .status{
+  display:inline-block;font-size:12px;font-weight:700;
+  padding:5px 14px;border-radius:99px;
+}
+.code-big.success .status{background:#059669;color:#fff}
+.code-big.fail .status{background:#dc2626;color:#fff}
+.code-big.pending .status{background:#d97706;color:#fff}
+.code-big.duplicate .status{background:#94a3b8;color:#fff}
+
+.code-big .empty{color:var(--muted);font-size:14px;padding:14px 0}
+
+.code-big .copy{margin-top:12px;padding:8px 16px;border-radius:8px;background:var(--bg-alt);border:1px solid var(--border);color:var(--text);font-size:12px;font-weight:700;cursor:pointer}
+.code-big .copy:active{transform:scale(.95)}
 
 .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#0f172a;color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;font-weight:600;z-index:9999;transition:.25s;box-shadow:0 8px 24px rgba(0,0,0,.25);max-width:90vw;text-align:center}
 </style>
@@ -624,9 +658,7 @@ body{
 
 <!-- LOGIN TELEGRAM -->
 <div id="view-login" class="view">
-  <button class="back" onclick="showView('view-home')">
-    <svg class="icon icon-sm" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg> Quay lại
-  </button>
+  <button class="back" onclick="showView('view-home')"><svg class="icon icon-sm" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg> Quay lại</button>
   <div class="panel">
     <div class="ttl">Kết nối Telegram</div>
     <div class="desc">Lấy API ID & Hash tại <b>my.telegram.org</b></div>
@@ -639,9 +671,7 @@ body{
 
 <!-- OTP -->
 <div id="view-otp" class="view">
-  <button class="back" onclick="showView('view-login')">
-    <svg class="icon icon-sm" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg> Quay lại
-  </button>
+  <button class="back" onclick="showView('view-login')"><svg class="icon icon-sm" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg> Quay lại</button>
   <div class="panel">
     <div class="ttl">Nhập mã OTP</div>
     <div class="desc">Mã đã gửi đến Telegram của bạn</div>
@@ -652,9 +682,7 @@ body{
 
 <!-- 2FA -->
 <div id="view-2fa" class="view">
-  <button class="back" onclick="showView('view-otp')">
-    <svg class="icon icon-sm" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg> Quay lại
-  </button>
+  <button class="back" onclick="showView('view-otp')"><svg class="icon icon-sm" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg> Quay lại</button>
   <div class="panel">
     <div class="ttl">Xác thực 2 lớp</div>
     <div class="desc">Tài khoản được bảo vệ bằng 2FA</div>
@@ -668,40 +696,62 @@ body{
   <div class="panel">
     <div class="ttl">Đăng nhập LC79</div>
     <div class="desc">Dán <b>MD5 hash</b> (32 ký tự hex) của mật khẩu — hoặc nhập mật khẩu thô để tự hash.</div>
-    <div class="field">
-      <label>Tài khoản LC79</label>
-      <input type="text" id="lc79User" placeholder="username" autocomplete="off">
-    </div>
+    <div class="field"><label>Tài khoản LC79</label><input type="text" id="lc79User" placeholder="username" autocomplete="off"></div>
     <div class="field">
       <label>Mật khẩu (MD5 hoặc thô)</label>
       <input type="text" id="lc79Pass" placeholder="32 hex MD5 hoặc password thật" autocomplete="off">
-      <div class="hint">💡 Nhập 32 ký tự hex → dùng luôn. Nhập password thường → tự MD5.</div>
+      <div class="hint">💡 32 ký tự hex → dùng luôn. Password thường → tự MD5.</div>
     </div>
     <div class="field">
       <label>Nickname (tùy chọn)</label>
       <input type="text" id="lc79Nick" placeholder="Mặc định = username" autocomplete="off">
-      <div class="hint">⚠️ Chỉ điền nếu nickname trong game KHÁC username.</div>
+      <div class="hint">⚠️ Chỉ điền nếu nickname khác username.</div>
     </div>
     <button class="btn" id="btn-lc79" onclick="loginLC79()">Bắt đầu Auto</button>
   </div>
 </div>
 
-<!-- RESULT -->
+<!-- RESULT / DASHBOARD -->
 <div id="view-result" class="view">
   <div class="status-bar" id="statusBar">
     <div class="dot"></div>
     <span id="statusText">Đang khởi động...</span>
   </div>
-  <div class="codes-wrap">
-    <div class="codes-head">
-      <span>10 code mới nhất</span>
-      <span class="count" id="codesCount">0</span>
+
+  <!-- ACCOUNT INFO CARD -->
+  <div class="acc-card" id="accCard">
+    <div class="acc-top">
+      <div class="acc-avatar" id="accAvatar">?</div>
+      <div style="flex:1">
+        <div class="acc-nick" id="accNick">---</div>
+        <div class="acc-lv" id="accLv">Level ---</div>
+      </div>
     </div>
-    <div id="codesList">
-      <div class="empty">Đang chờ code...</div>
+    <div class="acc-grid">
+      <div class="acc-stat"><div class="lbl">VIP</div><div class="val" id="statVip">-</div></div>
+      <div class="acc-stat"><div class="lbl">Xu</div><div class="val" id="statXu">-</div></div>
+      <div class="acc-stat"><div class="lbl">VIP Point</div><div class="val" id="statPoint">-</div></div>
+    </div>
+    <div class="level-bar"><div id="levelBarFill" style="width:0%"></div></div>
+  </div>
+
+  <!-- LATEST CODE CARD -->
+  <div class="code-big" id="codeCard">
+    <div class="lbl">Code gần nhất</div>
+    <div id="codeContent">
+      <div class="empty">⏳ Đang chờ code...</div>
     </div>
   </div>
-  <button class="btn ghost" style="margin-top:14px" onclick="showView('view-home')">Về trang chủ</button>
+
+  <!-- MANUAL INPUT -->
+  <div class="panel">
+    <div class="ttl">Nhập code thủ công</div>
+    <div class="desc">Nhập tay bất kỳ code nào để redeem ngay</div>
+    <div class="field"><input type="text" id="manualCode" placeholder="Nhập code..." autocomplete="off" style="text-transform:uppercase"></div>
+    <button class="btn" id="btn-manual" onclick="redeemManual()">Nhập code</button>
+  </div>
+
+  <button class="btn ghost" onclick="showView('view-home')">Về trang chủ</button>
 </div>
 
 <script>
@@ -709,8 +759,9 @@ const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
 
 let auth = { api_id:'', api_hash:'', phone:'', phone_code_hash:'', session:'', password:'' };
-let pollTimer = null;
 let lastVersion = -1;
+let polling = false;
+let currentCode = null;
 
 function showView(id){
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
@@ -785,58 +836,130 @@ async function loginLC79(){
     const d = await r.json();
     if (d.status === 'ok') {
       showView('view-result');
-      startPolling();
-    } else {
-      toast('❌ ' + d.message);
-    }
+      if (!polling) { polling = true; pollLoop(); }
+    } else toast('❌ ' + d.message);
   } catch(e){ toast('Lỗi kết nối!'); }
   finally { btn.disabled=false; btn.innerText='Bắt đầu Auto'; }
 }
 
-function startPolling(){
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(pollCodes, 100);
-  pollCodes();
-}
-
-async function pollCodes(){
+async function redeemManual(){
+  const code = document.getElementById('manualCode').value.trim().toUpperCase();
+  if (!code) return toast('Nhập code!');
+  const btn = document.getElementById('btn-manual');
+  btn.disabled = true; btn.innerText = 'Đang nhập...';
   try {
-    const r = await fetch('/api/get_codes', {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const r = await fetch('/api/redeem', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});
     const d = await r.json();
-    if (d.status !== 'ok') return;
-
-    const bar = document.getElementById('statusBar');
-    const txt = document.getElementById('statusText');
-    if (d.listener && d.lc79) { bar.classList.add('on'); txt.innerText = '🟢 Auto ON — Đang lắng nghe'; }
-    else if (d.listener) { bar.classList.add('on'); txt.innerText = '🟡 Listener ON — Chưa login LC79'; }
-    else { bar.classList.remove('on'); txt.innerText = '🔴 Offline'; }
-
-    if (d.version !== lastVersion) {
-      lastVersion = d.version;
-      renderCodes(d.codes);
-    }
-  } catch(e){}
+    if (d.status === 'ok') {
+      toast('🚀 ' + d.message);
+      document.getElementById('manualCode').value = '';
+    } else toast('❌ ' + d.message);
+  } catch(e){ toast('Lỗi kết nối!'); }
+  finally { btn.disabled=false; btn.innerText='Nhập code'; }
 }
 
-function renderCodes(codes){
-  const list = document.getElementById('codesList');
-  document.getElementById('codesCount').innerText = codes.length;
-  if (!codes.length) {
-    list.innerHTML = '<div class="empty">Đang chờ code...</div>';
+// ========== POLLING RECURSIVE 100ms ==========
+async function pollLoop(){
+  if (document.hidden) {
+    // Tab ẩn → giảm tải 500ms
+    setTimeout(pollLoop, 500);
     return;
   }
-  list.innerHTML = codes.map((c, i) => {
-    const num = String(i+1).padStart(2,'0');
-    const st = c.status || 'pending';
-    const cls = ['success','fail','pending','duplicate'].includes(st) ? st : 'pending';
-    const label = c.message || ({success:'✓',fail:'✗',pending:'...',duplicate:'Đã nhập'}[st] || st);
-    return `<div class="code-row">
-      <div class="code-num">${num}</div>
-      <div class="code-val">${c.code}</div>
-      <div class="code-status ${cls}" title="${label}">${label}</div>
-    </div>`;
-  }).join('');
+  try {
+    await fetchAndRender();
+  } catch(e){}
+  setTimeout(pollLoop, 100);
 }
+
+async function fetchAndRender(){
+  const r = await fetch('/api/get_codes', {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  const d = await r.json();
+  if (d.status !== 'ok') return;
+
+  // Status bar
+  const bar = document.getElementById('statusBar');
+  const txt = document.getElementById('statusText');
+  if (d.listener && d.lc79) { bar.classList.add('on'); txt.innerText = '🟢 Auto ON — Sẵn sàng bắt code'; }
+  else if (d.listener) { bar.classList.add('on'); txt.innerText = '🟡 Listener ON — Chưa login LC79'; }
+  else { bar.classList.remove('on'); txt.innerText = '🔴 Offline'; }
+
+  // Account info
+  renderAccount(d);
+
+  // Latest code
+  if (d.version !== lastVersion) {
+    lastVersion = d.version;
+    renderCode(d.code);
+  }
+}
+
+function renderAccount(d){
+  const info = d.info || {};
+  const nick = info.nickname || d.nickname || '---';
+  document.getElementById('accNick').innerText = nick;
+  document.getElementById('accAvatar').innerText = (nick[0] || '?').toUpperCase();
+
+  const lv = d.curLevel || info.curLevel || 0;
+  document.getElementById('accLv').innerText = 'Level ' + lv;
+
+  document.getElementById('statVip').innerText = fmtNum(info.vipTotal);
+  document.getElementById('statXu').innerText = fmtNum(info.xuTotal);
+  document.getElementById('statPoint').innerText = fmtNum(info.vippoint);
+
+  // Level progress (dựa trên levelRatio)
+  const ratio = d.levelRatio || info.levelRatio || [];
+  let pct = 0;
+  if (ratio.length && lv >= 0 && lv < ratio.length - 1) {
+    const cur = ratio[lv];
+    const next = ratio[lv + 1];
+    const vip = info.vipTotal || 0;
+    if (next > cur) pct = Math.min(100, Math.max(0, ((vip - cur) / (next - cur)) * 100));
+  }
+  document.getElementById('levelBarFill').style.width = pct + '%';
+}
+
+function renderCode(c){
+  currentCode = c;
+  const card = document.getElementById('codeCard');
+  const content = document.getElementById('codeContent');
+  card.className = 'code-big';
+
+  if (!c) {
+    content.innerHTML = '<div class="empty">⏳ Đang chờ code...</div>';
+    return;
+  }
+
+  const st = c.status || 'pending';
+  card.classList.add(st === 'success' ? 'success' : st === 'fail' ? 'fail' : st === 'duplicate' ? 'pending' : 'pending');
+
+  const labelMap = {success:'✓ Đã nhập', fail:'✗ Thất bại', pending:'⏳ Đang xử lý', duplicate:'↺ Đã nhập trước đó'};
+  const label = labelMap[st] || st;
+  const detail = c.message && c.message !== label ? ' — ' + c.message : '';
+
+  content.innerHTML = `
+    <div class="val">${c.code}</div>
+    <div class="status">${label}${detail}</div>
+    ${st === 'success' || st === 'pending' ? `<button class="copy" onclick="copyCode('${c.code}')">📋 Copy code</button>` : ''}
+  `;
+
+  if (st === 'success' && tg) tg.HapticFeedback?.notificationOccurred('success');
+}
+
+function copyCode(code){
+  navigator.clipboard.writeText(code).then(()=>toast('Đã copy: ' + code));
+}
+
+function fmtNum(n){
+  if (n === null || n === undefined) return '-';
+  return Number(n).toLocaleString('vi-VN');
+}
+
+// Auto resume polling khi vào lại view result
+document.addEventListener('visibilitychange', ()=>{
+  if (!document.hidden && polling && !document.getElementById('view-result').classList.contains('active') === false) {
+    // nothing extra
+  }
+});
 </script>
 </body>
 </html>
@@ -845,6 +968,7 @@ function renderCodes(codes){
 @flask_app.route("/")
 def index():
     return Response(MINIAPP_HTML, mimetype="text/html")
+
 
 # ================================================================
 #                    BOT
@@ -870,10 +994,11 @@ START_MESSAGE = """
 ━━━━━━━━━━━━━━━━━━━━
 ⚡ <b>TÍNH NĂNG</b>
 • Đăng nhập Telegram an toàn (OTP + 2FA)
-• Auto bắt tin nhắn code real-time (millisecond)
+• Auto bắt tin nhắn real-time (millisecond)
 • Tự động nhập code khi vừa xuất hiện
-• Hiển thị 10 code mới nhất, cập nhật 0.1s
-• Hỗ trợ MD5 hash trực tiếp (như config gốc)
+• Dashboard: Nick, VIP, Xu, Level, progress
+• Nhập code thủ công bằng tay
+• Hỗ trợ MD5 hash trực tiếp
 """
 
 KEYBOARD = InlineKeyboardMarkup([[
