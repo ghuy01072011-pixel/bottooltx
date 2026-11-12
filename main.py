@@ -42,22 +42,17 @@ READ_TIMEOUT = 45
 
 # ============ GLOBAL STATE ============
 STATE = {
-    "codes": [], # [{"code": "XXXX", "status": "Pending", "msg": ""}]
+    "codes": [],
     "lc79_account": None,
     "listener_running": False,
-    "user_chat_id": None # Lưu ID Telegram của User để gửi thông báo
+    "user_chat_id": None
 }
 
 def notify_user(text):
-    if not STATE["user_chat_id"]:
-        return
+    if not STATE["user_chat_id"]: return
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, json={
-            "chat_id": STATE["user_chat_id"],
-            "text": text,
-            "parse_mode": "HTML"
-        }, timeout=5)
+        requests.post(url, json={"chat_id": STATE["user_chat_id"], "text": text, "parse_mode": "HTML"}, timeout=5)
     except Exception as e:
         logger.error(f"Lỗi gửi thông báo: {e}")
 
@@ -67,7 +62,7 @@ def notify_user(text):
 class Account:
     def __init__(self, un, pw, nick):
         self.un = un
-        self.pw = pw # Đã được hash MD5
+        self.pw = pw 
         self.nick = nick
         self.used_codes = set()
         self.lock = threading.Lock()
@@ -77,14 +72,12 @@ class Account:
     def _headers(self, auth=None):
         h = {
             "content-type": "application/json",
-            "user-agent": "Mozilla/5.0",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "origin": "https://lc79.to",
             "referer": "https://lc79.to/",
             "accept": "application/json, text/plain, */*",
-            "connection": "close",
         }
-        if auth:
-            h["authorization"] = f"Bearer {auth}"
+        if auth: h["authorization"] = f"Bearer {auth}"
         return h
 
     @staticmethod
@@ -108,43 +101,48 @@ class Account:
                     "cp": "R", "cl": "R", "pf": "web", "at": ""
                 }, headers=self._headers(), timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             data = res.json()
+            logger.info(f"[BƯỚC 1] Response: {data}")
+            
             if data.get("success"):
                 return data.get("accessToken") or data.get("sessionKey")
-            return None
-        except Exception:
+            else:
+                logger.warning(f"[BƯỚC 1] Lỗi API: {data}")
+                return None
+        except Exception as e:
+            logger.error(f"[BƯỚC 1] Lỗi kết nối: {e}")
             return None
 
     def refresh_token(self):
         access_token = self.get_access_token()
         if not access_token:
-            return False
+            return False, "Sai tài khoản hoặc mật khẩu (Bước 1 thất bại)."
 
         try:
-            login_headers = {
-                "content-type": "application/json",
-                "origin": "https://lc79b.bet",
-                "referer": "https://lc79b.bet/",
-                "user-agent": "Mozilla/5.0",
-                "connection": "close",
-            }
+            login_headers = self._headers()
+            login_headers["origin"] = "https://lc79b.bet"
+            login_headers["referer"] = "https://lc79b.bet/"
+            
             with requests.Session() as s:
                 res = s.post(LOGIN_URL, headers=login_headers, json={
-                    "nickName": self.nick, "accessToken": access_token
+                    "nickName": self.nick, 
+                    "accessToken": access_token
                 }, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             data = res.json()
+            logger.info(f"[BƯỚC 2] Response: {data}")
             
-            # FIX: API trả về accessToken hoặc sessionKey thay vì token
             new_token = data.get("accessToken") or data.get("sessionKey") or data.get("token")
             if new_token:
                 self.jwt = new_token
                 self.jwt_exp = self.parse_jwt_exp(new_token)
                 if self.jwt_exp == 0:
-                    self.jwt_exp = time.time() + 3600 # Fallback 1 giờ nếu không phải JWT
-                return True
-            return False
+                    self.jwt_exp = time.time() + 3600
+                return True, "OK"
+            else:
+                msg = data.get("message") or data.get("msg") or "Lỗi không xác định từ server LC79."
+                return False, msg
         except Exception as e:
-            logger.error(f"Refresh token error: {e}")
-            return False
+            logger.error(f"[BƯỚC 2] Lỗi kết nối: {e}")
+            return False, "Lỗi kết nối đến server LC79."
 
     def redeem_code(self, code, _retry=False, _attempt=0):
         with self.lock:
@@ -153,26 +151,21 @@ class Account:
             self.used_codes.add(code)
 
         if not self.is_token_valid():
-            if not self.refresh_token():
-                return False, "Lỗi Token"
+            success, msg = self.refresh_token()
+            if not success:
+                return False, f"Lỗi Token: {msg}"
 
         try:
             with requests.Session() as s:
-                res = s.post(
-                    BASE_URL + PARAMS,
-                    headers=self._headers(self.jwt),
-                    json={"code": code.strip(), "captcha": ""},
-                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)
-                )
-            try:
-                data = res.json()
-            except Exception:
-                data = {}
+                res = s.post(BASE_URL + PARAMS, headers=self._headers(self.jwt),
+                             json={"code": code.strip(), "captcha": ""}, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+            try: data = res.json()
+            except: data = {}
 
             if res.status_code == 401:
-                if self.refresh_token():
-                    with self.lock:
-                        self.used_codes.discard(code)
+                success, _ = self.refresh_token()
+                if success:
+                    with self.lock: self.used_codes.discard(code)
                     return self.redeem_code(code, _retry=True)
                 return False, "Lỗi xác thực"
 
@@ -188,7 +181,6 @@ class Account:
                 return False, "Quá giới hạn"
             else:
                 return False, f"Lỗi {res.status_code}"
-
         except Exception:
             if _attempt < 2:
                 return self.redeem_code(code, _retry=_retry, _attempt=_attempt+1)
@@ -196,19 +188,17 @@ class Account:
 
 def process_new_code(code):
     for c in STATE["codes"]:
-        if c["code"] == code:
-            return
+        if c["code"] == code: return
             
     logger.info(f"🔥 PHÁT HIỆN CODE MỚI: {code}")
     new_item = {"code": code, "status": "Pending", "msg": "Đang chờ..."}
     STATE["codes"].insert(0, new_item)
-    if len(STATE["codes"]) > 10:
-        STATE["codes"] = STATE["codes"][:10]
+    if len(STATE["codes"]) > 10: STATE["codes"] = STATE["codes"][:10]
         
     if STATE["lc79_account"]:
         threading.Thread(target=redeem_thread, args=(new_item, STATE["lc79_account"])).start()
     else:
-        notify_user(f"🔔 <b>Phát hiện code mới:</b> <code>{code}</code>\nVui lòng mở Mini App và đăng nhập LC79 để tự động nhập!")
+        notify_user(f"🔔 <b>Phát hiện code mới:</b> <code>{code}</code>\nVui lòng mở Mini App và đăng nhập LC79!")
 
 def redeem_thread(item, acc):
     item["status"] = "Processing"
@@ -218,20 +208,17 @@ def redeem_thread(item, acc):
     if success:
         item["status"] = "Success"
         item["msg"] = msg
-        logger.info(f"✅ REDEEM THÀNH CÔNG: {item['code']} - {msg}")
         notify_user(f"✅ <b>NHẬP CODE THÀNH CÔNG</b>\n\n🎁 Mã: <code>{item['code']}</code>\n💰 Nhận được: <b>{msg}</b>")
     else:
         item["status"] = "Failed"
         item["msg"] = msg
-        logger.warning(f"❌ REDEEM THẤT BẠI: {item['code']} - {msg}")
         notify_user(f"❌ <b>NHẬP CODE THẤT BẠI</b>\n\n🎁 Mã: <code>{item['code']}</code>\n⚠️ Lý do: {msg}")
 
 # ================================================================
-#                    TELEGRAM BACKGROUND LISTENER (SIÊU NHANH)
+#                    TELEGRAM BACKGROUND LISTENER
 # ================================================================
 def start_background_listener(session_str, api_id, api_hash):
-    if STATE["listener_running"]:
-        return
+    if STATE["listener_running"]: return
     STATE["listener_running"] = True
     
     def run():
@@ -244,18 +231,14 @@ def start_background_listener(session_str, api_id, api_hash):
             try:
                 channel = await client.get_entity('codelaucuagame')
                 await client(functions.channels.JoinChannelRequest(channel=channel))
-            except Exception as e:
-                logger.warning(f"Join channel note: {e}")
+            except Exception as e: logger.warning(f"Join channel note: {e}")
 
             @client.on(events.NewMessage(chats='codelaucuagame'))
             async def handler(event):
                 text = event.raw_text or ""
                 match = re.search(r"LC79([A-Z0-9]+)", text)
-                if match:
-                    code = match.group(1)
-                    process_new_code(code)
+                if match: process_new_code(match.group(1))
 
-            logger.info("🚀 Background Listener đang chạy (Real-time)...")
             await client.run_until_disconnected()
 
         loop.run_until_complete(main())
@@ -268,19 +251,15 @@ def start_background_listener(session_str, api_id, api_hash):
 @flask_app.route("/api/send_code", methods=["POST"])
 def api_send_code():
     data = request.json
-    api_id, api_hash, phone = data.get("api_id"), data.get("api_hash"), data.get("phone")
-    if not all([api_id, api_hash, phone]):
-        return jsonify({"status": "error", "message": "Thiếu thông tin."})
     async def _send():
         try:
-            client = TelegramClient(StringSession(), int(api_id), api_hash)
+            client = TelegramClient(StringSession(), int(data.get("api_id")), data.get("api_hash"))
             await client.connect()
-            sent = await client.send_code_request(phone)
+            sent = await client.send_code_request(data.get("phone"))
             session_str = client.session.save()
             await client.disconnect()
             return {"status": "ok", "phone_code_hash": sent.phone_code_hash, "session": session_str}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
+        except Exception as e: return {"status": "error", "message": str(e)}
     return jsonify(asyncio.run(_send()))
 
 @flask_app.route("/api/verify_code", methods=["POST"])
@@ -304,8 +283,7 @@ def api_verify_code():
             await client.disconnect()
             start_background_listener(new_session, data.get("api_id"), data.get("api_hash"))
             return {"status": "ok", "session": new_session}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
+        except Exception as e: return {"status": "error", "message": str(e)}
     return jsonify(asyncio.run(_verify()))
 
 @flask_app.route("/api/verify_2fa", methods=["POST"])
@@ -325,8 +303,7 @@ def api_verify_2fa():
             await client.disconnect()
             start_background_listener(new_session, data.get("api_id"), data.get("api_hash"))
             return {"status": "ok", "session": new_session}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
+        except Exception as e: return {"status": "error", "message": str(e)}
     return jsonify(asyncio.run(_verify_2fa()))
 
 @flask_app.route("/api/login_lc79", methods=["POST"])
@@ -335,30 +312,27 @@ def api_login_lc79():
     un, pw = data.get("username"), data.get("password")
     user_id = data.get("user_id")
     
-    if user_id:
-        STATE["user_chat_id"] = user_id
-        
-    if not un or not pw:
-        return jsonify({"status": "error", "message": "Thiếu thông tin."})
+    if user_id: STATE["user_chat_id"] = user_id
+    if not un or not pw: return jsonify({"status": "error", "message": "Thiếu thông tin."})
     
     md5_pw = hashlib.md5(pw.encode()).hexdigest()
     acc = Account(un, md5_pw, un)
     
-    if acc.refresh_token():
+    success, msg = acc.refresh_token()
+    if success:
         STATE["lc79_account"] = acc
         for item in STATE["codes"]:
             if item["status"] == "Pending":
                 threading.Thread(target=redeem_thread, args=(item, acc)).start()
         return jsonify({"status": "ok"})
-    return jsonify({"status": "error", "message": "Sai tài khoản/mật khẩu LC79."})
+    else:
+        return jsonify({"status": "error", "message": msg})
 
 @flask_app.route("/api/start_listener", methods=["POST"])
 def api_start_listener():
     data = request.json
-    if data.get("user_id"):
-        STATE["user_chat_id"] = data.get("user_id")
-    if data.get("session"):
-        start_background_listener(data.get("session"), data.get("api_id"), data.get("api_hash"))
+    if data.get("user_id"): STATE["user_chat_id"] = data.get("user_id")
+    if data.get("session"): start_background_listener(data.get("session"), data.get("api_id"), data.get("api_hash"))
     return jsonify({"status": "ok"})
 
 @flask_app.route("/api/state", methods=["GET"])
@@ -373,78 +347,33 @@ MINIAPP_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-<meta name="theme-color" content="#f8fafc">
 <title>Auto Tool Center</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{
-  --bg: #f1f5f9;
-  --surface: #ffffff;
-  --text: #0f172a;
-  --text-muted: #64748b;
-  --primary: #3b82f6;
-  --primary-hover: #2563eb;
-  --success: #10b981;
-  --danger: #ef4444;
-  --border: #e2e8f0;
-}
+:root{--bg:#f1f5f9;--surface:#fff;--text:#0f172a;--text-muted:#64748b;--primary:#3b82f6;--success:#10b981;--danger:#ef4444;--border:#e2e8f0;}
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
-body{
-  font-family: 'Inter', -apple-system, sans-serif;
-  background: var(--bg); color: var(--text);
-  min-height: 100vh; padding: 20px 16px;
-  display: flex; flex-direction: column; align-items: center;
-}
-.app-container { width: 100%; max-width: 480px; }
-.view{display:none; animation:fadeIn .3s ease;}
-.view.active{display:block;}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding:20px 16px;display:flex;flex-direction:column;align-items:center;}
+.app-container{width:100%;max-width:480px;}.view{display:none;animation:fadeIn .3s ease;}.view.active{display:block;}
 @keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
-.card {
-  background: var(--surface); border-radius: 16px; padding: 24px 20px;
-  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.05);
-  border: 1px solid var(--border); margin-bottom: 16px;
-}
-.header { text-align: center; margin-bottom: 24px; }
-.header h1 { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
-.header p { color: var(--text-muted); font-size: 14px; }
-.input-group { margin-bottom: 16px; }
-.input-group label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
-.input-group input {
-  width: 100%; padding: 14px 16px; border-radius: 12px;
-  border: 1px solid var(--border); font-size: 15px; outline: none; transition: 0.2s;
-  background: #f8fafc;
-}
-.input-group input:focus { border-color: var(--primary); background: #fff; box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1); }
-.btn {
-  width: 100%; padding: 16px; border: none; border-radius: 12px;
-  background: var(--primary); color: white; font-size: 16px; font-weight: 600;
-  cursor: pointer; transition: 0.2s; display: flex; justify-content: center; align-items: center; gap: 8px;
-  margin-top: 8px;
-}
-.btn:active { transform: scale(0.98); }
-.btn:disabled { opacity: 0.6; pointer-events: none; }
-.code-list { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
-.code-item {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 14px 16px; border-radius: 12px; border: 1px solid var(--border);
-  background: #f8fafc; animation: slideIn 0.2s ease;
-}
-@keyframes slideIn { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: none; } }
-.code-left { display: flex; flex-direction: column; gap: 4px; }
-.code-text { font-family: monospace; font-size: 16px; font-weight: 700; letter-spacing: 1px; color: var(--text); }
-.code-msg { font-size: 12px; color: var(--text-muted); font-weight: 500; }
-.code-status { font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 99px; }
-.status-Pending { background: #fef3c7; color: #d97706; }
-.status-Processing { background: #e0f2fe; color: #0284c7; }
-.status-Success { background: #d1fae5; color: #059669; }
-.status-Failed { background: #fee2e2; color: #dc2626; }
-.back-btn { background: none; border: none; color: var(--text-muted); font-size: 14px; font-weight: 500; cursor: pointer; margin-bottom: 16px; display: inline-flex; align-items: center; gap: 4px; }
+.card{background:var(--surface);border-radius:16px;padding:24px 20px;box-shadow:0 4px 6px -1px rgb(0 0 0 / 0.05);border:1px solid var(--border);margin-bottom:16px;}
+.header{text-align:center;margin-bottom:24px;}.header h1{font-size:22px;font-weight:700;margin-bottom:6px;}.header p{color:var(--text-muted);font-size:14px;}
+.input-group{margin-bottom:16px;}.input-group label{display:block;font-size:13px;font-weight:600;margin-bottom:6px;}
+.input-group input{width:100%;padding:14px 16px;border-radius:12px;border:1px solid var(--border);font-size:15px;outline:none;transition:.2s;background:#f8fafc;}
+.input-group input:focus{border-color:var(--primary);background:#fff;box-shadow:0 0 0 3px rgba(59,130,246,0.1);}
+.btn{width:100%;padding:16px;border:none;border-radius:12px;background:var(--primary);color:#fff;font-size:16px;font-weight:600;cursor:pointer;transition:.2s;display:flex;justify-content:center;align-items:center;margin-top:8px;}
+.btn:active{transform:scale(0.98);}.btn:disabled{opacity:0.6;pointer-events:none;}
+.code-list{display:flex;flex-direction:column;gap:10px;margin-top:16px;}
+.code-item{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;border-radius:12px;border:1px solid var(--border);background:#f8fafc;animation:slideIn 0.2s ease;}
+@keyframes slideIn{from{opacity:0;transform:translateY(-5px);}to{opacity:1;transform:none;}}
+.code-left{display:flex;flex-direction:column;gap:4px;}.code-text{font-family:monospace;font-size:16px;font-weight:700;color:var(--text);}.code-msg{font-size:12px;color:var(--text-muted);font-weight:500;}
+.code-status{font-size:11px;font-weight:700;padding:4px 10px;border-radius:99px;}
+.status-Pending{background:#fef3c7;color:#d97706;}.status-Processing{background:#e0f2fe;color:#0284c7;}.status-Success{background:#d1fae5;color:#059669;}.status-Failed{background:#fee2e2;color:#dc2626;}
+.back-btn{background:none;border:none;color:var(--text-muted);font-size:14px;font-weight:500;cursor:pointer;margin-bottom:16px;display:inline-flex;align-items:center;gap:4px;}
 </style>
 </head>
 <body>
 <div class="app-container">
-  <!-- VIEW 1: TELEGRAM LOGIN -->
   <div id="view-tg-login" class="view">
     <div class="header"><h1>Kết Nối Telegram</h1><p>Nhập API để bắt đầu lấy code</p></div>
     <div class="card">
@@ -454,8 +383,6 @@ body{
       <button class="btn" id="btn-send-code" onclick="sendCode()">Tiếp Tục</button>
     </div>
   </div>
-
-  <!-- VIEW 2: OTP -->
   <div id="view-tg-otp" class="view">
     <button class="back-btn" onclick="showView('view-tg-login')">← Quay lại</button>
     <div class="header"><h1>Nhập Mã OTP</h1><p>Kiểm tra tin nhắn Telegram của bạn</p></div>
@@ -464,8 +391,6 @@ body{
       <button class="btn" id="btn-verify" onclick="verifyCode()">Xác Nhận</button>
     </div>
   </div>
-
-  <!-- VIEW 3: 2FA -->
   <div id="view-tg-2fa" class="view">
     <div class="header"><h1>Xác Thực 2 Lớp</h1><p>Tài khoản của bạn có bật 2FA</p></div>
     <div class="card">
@@ -473,8 +398,6 @@ body{
       <button class="btn" id="btn-verify-2fa" onclick="verify2FA()">Đăng Nhập</button>
     </div>
   </div>
-
-  <!-- VIEW 4: LC79 LOGIN -->
   <div id="view-lc79-login" class="view">
     <div class="header"><h1>Đăng Nhập LC79</h1><p>Tool sẽ tự động nhập code khi có mã mới</p></div>
     <div class="card">
@@ -483,13 +406,9 @@ body{
       <button class="btn" id="btn-login-lc79" onclick="loginLC79()">Kết Nối & Chạy Auto</button>
     </div>
   </div>
-
-  <!-- VIEW 5: DASHBOARD -->
   <div id="view-dashboard" class="view">
     <div class="header"><h1>Hệ Thống Đang Chạy</h1><p>Đang chờ code mới từ kênh...</p></div>
-    <div class="card" style="padding: 16px;">
-      <div class="code-list" id="code-list"></div>
-    </div>
+    <div class="card" style="padding:16px;"><div class="code-list" id="code-list"></div></div>
   </div>
 </div>
 
@@ -497,8 +416,7 @@ body{
 const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
 const tgUserId = tg?.initDataUnsafe?.user?.id;
-
-let authData = { api_id: '', api_hash: '', phone: '', phone_code_hash: '', session: '', password: '' };
+let authData = { api_id: '', api_hash: '', phone: '', phone_code_hash: '', session: '' };
 let pollInterval = null;
 
 function showView(id) {
@@ -513,19 +431,14 @@ async function sendCode() {
   if (!api_id || !api_hash || !phone) return alert("Nhập đủ thông tin!");
   const btn = document.getElementById('btn-send-code');
   btn.innerText = "Đang gửi..."; btn.disabled = true;
-
   try {
-    const res = await fetch('/api/send_code', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ api_id, api_hash, phone })
-    });
+    const res = await fetch('/api/send_code', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_id, api_hash, phone }) });
     const data = await res.json();
     if (data.status === 'ok') {
       authData = { ...authData, api_id, api_hash, phone, phone_code_hash: data.phone_code_hash, session: data.session };
       showView('view-tg-otp');
     } else alert("Lỗi: " + data.message);
-  } catch (e) { alert("Lỗi mạng!"); }
-  finally { btn.innerText = "Tiếp Tục"; btn.disabled = false; }
+  } catch (e) { alert("Lỗi mạng!"); } finally { btn.innerText = "Tiếp Tục"; btn.disabled = false; }
 }
 
 async function verifyCode() {
@@ -533,20 +446,13 @@ async function verifyCode() {
   if (!code) return alert("Nhập OTP!");
   const btn = document.getElementById('btn-verify');
   btn.innerText = "Đang xác thực..."; btn.disabled = true;
-
   try {
-    const res = await fetch('/api/verify_code', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...authData, code })
-    });
+    const res = await fetch('/api/verify_code', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...authData, code }) });
     const data = await res.json();
     if (data.status === 'ok') saveSessionAndStart(data.session);
-    else if (data.status === '2fa') {
-      authData.session = data.session;
-      showView('view-tg-2fa');
-    } else alert("Lỗi: " + data.message);
-  } catch (e) { alert("Lỗi mạng!"); }
-  finally { btn.innerText = "Xác Nhận"; btn.disabled = false; }
+    else if (data.status === '2fa') { authData.session = data.session; showView('view-tg-2fa'); } 
+    else alert("Lỗi: " + data.message);
+  } catch (e) { alert("Lỗi mạng!"); } finally { btn.innerText = "Xác Nhận"; btn.disabled = false; }
 }
 
 async function verify2FA() {
@@ -554,17 +460,12 @@ async function verify2FA() {
   if (!password) return alert("Nhập mật khẩu 2FA!");
   const btn = document.getElementById('btn-verify-2fa');
   btn.innerText = "Đang xác thực..."; btn.disabled = true;
-
   try {
-    const res = await fetch('/api/verify_2fa', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...authData, password })
-    });
+    const res = await fetch('/api/verify_2fa', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...authData, password }) });
     const data = await res.json();
     if (data.status === 'ok') saveSessionAndStart(data.session);
     else alert("Lỗi: " + data.message);
-  } catch (e) { alert("Lỗi mạng!"); }
-  finally { btn.innerText = "Đăng Nhập"; btn.disabled = false; }
+  } catch (e) { alert("Lỗi mạng!"); } finally { btn.innerText = "Đăng Nhập"; btn.disabled = false; }
 }
 
 function saveSessionAndStart(session) {
@@ -572,11 +473,7 @@ function saveSessionAndStart(session) {
   localStorage.setItem('tg_session', session);
   localStorage.setItem('api_id', authData.api_id);
   localStorage.setItem('api_hash', authData.api_hash);
-  
-  fetch('/api/start_listener', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ session, api_id: authData.api_id, api_hash: authData.api_hash, user_id: tgUserId })
-  });
+  fetch('/api/start_listener', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session, api_id: authData.api_id, api_hash: authData.api_hash, user_id: tgUserId }) });
   showView('view-lc79-login');
 }
 
@@ -586,53 +483,31 @@ async function loginLC79() {
   if (!username || !password) return alert("Nhập đủ tài khoản/mật khẩu!");
   const btn = document.getElementById('btn-login-lc79');
   btn.innerText = "Đang kết nối..."; btn.disabled = true;
-
   try {
-    const res = await fetch('/api/login_lc79', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password, user_id: tgUserId })
-    });
+    const res = await fetch('/api/login_lc79', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password, user_id: tgUserId }) });
     const data = await res.json();
-    if (data.status === 'ok') {
-      showView('view-dashboard');
-      startPolling();
-    } else alert("Lỗi: " + data.message);
-  } catch (e) { alert("Lỗi mạng!"); }
-  finally { btn.innerText = "Kết Nối & Chạy Auto"; btn.disabled = false; }
+    if (data.status === 'ok') { showView('view-dashboard'); startPolling(); } 
+    else alert("Lỗi đăng nhập: " + data.message);
+  } catch (e) { alert("Lỗi mạng!"); } finally { btn.innerText = "Kết Nối & Chạy Auto"; btn.disabled = false; }
 }
 
 function startPolling() {
   if (pollInterval) clearInterval(pollInterval);
   pollInterval = setInterval(async () => {
-    try {
-      const res = await fetch('/api/state');
-      const data = await res.json();
-      renderCodes(data.codes);
-    } catch (e) {}
+    try { const res = await fetch('/api/state'); const data = await res.json(); renderCodes(data.codes); } catch (e) {}
   }, 100);
 }
 
 function renderCodes(codes) {
   const container = document.getElementById('code-list');
-  if (!codes || codes.length === 0) {
-    container.innerHTML = '<div style="text-align:center; color:var(--text-muted); padding:20px 0; font-size:14px;">Đang chờ code mới...</div>';
-    return;
-  }
+  if (!codes || codes.length === 0) { container.innerHTML = '<div style="text-align:center; color:var(--text-muted); padding:20px 0; font-size:14px;">Đang chờ code mới...</div>'; return; }
   let html = '';
   codes.forEach(item => {
     let statusClass = 'status-Pending';
     if (item.status === 'Success') statusClass = 'status-Success';
     if (item.status === 'Failed') statusClass = 'status-Failed';
     if (item.status === 'Processing') statusClass = 'status-Processing';
-    html += `
-      <div class="code-item">
-        <div class="code-left">
-          <div class="code-text">${item.code}</div>
-          <div class="code-msg">${item.msg || ''}</div>
-        </div>
-        <div class="code-status ${statusClass}">${item.status}</div>
-      </div>
-    `;
+    html += `<div class="code-item"><div class="code-left"><div class="code-text">${item.code}</div><div class="code-msg">${item.msg || ''}</div></div><div class="code-status ${statusClass}">${item.status}</div></div>`;
   });
   container.innerHTML = html;
 }
@@ -641,25 +516,14 @@ async function init() {
   const savedSession = localStorage.getItem('tg_session');
   const savedApiId = localStorage.getItem('api_id');
   const savedApiHash = localStorage.getItem('api_hash');
-
   if (savedSession && savedApiId && savedApiHash) {
-    fetch('/api/start_listener', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session: savedSession, api_id: savedApiId, api_hash: savedApiHash, user_id: tgUserId })
-    });
+    fetch('/api/start_listener', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session: savedSession, api_id: savedApiId, api_hash: savedApiHash, user_id: tgUserId }) });
     try {
-      const res = await fetch('/api/state');
-      const data = await res.json();
-      if (data.has_lc79) {
-        showView('view-dashboard');
-        startPolling();
-      } else {
-        showView('view-lc79-login');
-      }
+      const res = await fetch('/api/state'); const data = await res.json();
+      if (data.has_lc79) { showView('view-dashboard'); startPolling(); } 
+      else showView('view-lc79-login');
     } catch (e) { showView('view-tg-login'); }
-  } else {
-    showView('view-tg-login');
-  }
+  } else showView('view-tg-login');
 }
 init();
 </script>
@@ -668,12 +532,9 @@ init();
 """
 
 @flask_app.route("/")
-def index():
-    return Response(MINIAPP_HTML, mimetype="text/html")
-
+def index(): return Response(MINIAPP_HTML, mimetype="text/html")
 @flask_app.route("/health")
-def health():
-    return Response("ok", mimetype="text/plain")
+def health(): return Response("ok", mimetype="text/plain")
 
 # ================================================================
 #                    SELF-PING & BOT MAIN
@@ -705,22 +566,15 @@ START_MESSAGE = """
 🎯 <b>Bấm nút bên dưới để trải nghiệm ngay</b> 👇
 """
 
-KEYBOARD = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🚀 MỞ MINI APP VIP", web_app=WebAppInfo(url=WEBAPP_URL or "https://example.com"))],
-])
+KEYBOARD = InlineKeyboardMarkup([[InlineKeyboardButton("🚀 MỞ MINI APP VIP", web_app=WebAppInfo(url=WEBAPP_URL or "https://example.com"))]])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or "bạn"
-    await update.message.reply_text(
-        START_MESSAGE.format(name=name), parse_mode="HTML", reply_markup=KEYBOARD, disable_web_page_preview=True
-    )
+    await update.message.reply_text(START_MESSAGE.format(name=name), parse_mode="HTML", reply_markup=KEYBOARD, disable_web_page_preview=True)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(context.error, Conflict):
-        logger.warning("⚠️ Conflict Bot! Chờ 10s...")
         await asyncio.sleep(10)
-    else:
-        logger.error(f"Lỗi: {context.error}")
 
 async def post_init(application: Application):
     await application.bot.set_my_commands([BotCommand("start", "Khởi động Tool")])
@@ -729,16 +583,11 @@ def main():
     if not BOT_TOKEN: return
     threading.Thread(target=keep_alive, daemon=True).start()
     threading.Thread(target=run_flask, daemon=True).start()
-
-    try:
-        requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true", timeout=5)
+    try: requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true", timeout=5)
     except: pass
-
     bot_app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_error_handler(error_handler)
-    
-    logger.info("Bot đang chạy...")
     bot_app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
