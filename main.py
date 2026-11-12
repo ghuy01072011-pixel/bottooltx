@@ -48,7 +48,6 @@ STATE = {
     "user_chat_id": None # Lưu ID Telegram của User để gửi thông báo
 }
 
-# Hàm gửi thông báo trực tiếp qua Telegram API
 def notify_user(text):
     if not STATE["user_chat_id"]:
         return
@@ -68,7 +67,7 @@ def notify_user(text):
 class Account:
     def __init__(self, un, pw, nick):
         self.un = un
-        self.pw = pw
+        self.pw = pw # Đã được hash MD5
         self.nick = nick
         self.used_codes = set()
         self.lock = threading.Lock()
@@ -110,7 +109,7 @@ class Account:
                 }, headers=self._headers(), timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             data = res.json()
             if data.get("success"):
-                return data.get("accessToken")
+                return data.get("accessToken") or data.get("sessionKey")
             return None
         except Exception:
             return None
@@ -133,13 +132,18 @@ class Account:
                     "nickName": self.nick, "accessToken": access_token
                 }, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             data = res.json()
-            new_token = data.get("token")
+            
+            # FIX: API trả về accessToken hoặc sessionKey thay vì token
+            new_token = data.get("accessToken") or data.get("sessionKey") or data.get("token")
             if new_token:
                 self.jwt = new_token
                 self.jwt_exp = self.parse_jwt_exp(new_token)
+                if self.jwt_exp == 0:
+                    self.jwt_exp = time.time() + 3600 # Fallback 1 giờ nếu không phải JWT
                 return True
             return False
-        except Exception:
+        except Exception as e:
+            logger.error(f"Refresh token error: {e}")
             return False
 
     def redeem_code(self, code, _retry=False, _attempt=0):
@@ -233,7 +237,6 @@ def start_background_listener(session_str, api_id, api_hash):
     def run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        # request_retries và connection_retries cao để đảm bảo không rớt mạng
         client = TelegramClient(StringSession(session_str), int(api_id), api_hash, loop=loop, connection_retries=None)
         
         async def main():
@@ -244,7 +247,6 @@ def start_background_listener(session_str, api_id, api_hash):
             except Exception as e:
                 logger.warning(f"Join channel note: {e}")
 
-            # Lắng nghe tin nhắn mới với độ trễ ~0ms
             @client.on(events.NewMessage(chats='codelaucuagame'))
             async def handler(event):
                 text = event.raw_text or ""
