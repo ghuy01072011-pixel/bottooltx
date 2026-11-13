@@ -35,7 +35,7 @@ PERSIST_FILE     = os.getenv("PERSIST_FILE", "sessions_store.json")
 # ===== REAL-TIME AUTO-REDEEM CONFIG =====
 FAST_POLL_INTERVAL = float(os.getenv("FAST_POLL_INTERVAL", "0.1"))  # 0.1s = 10Hz
 FAST_POLL_BATCH    = int(os.getenv("FAST_POLL_BATCH", "20"))       # max msgs per poll
-FAST_POLL_IDLE_BACKOFF = int(os.getenv("FAST_POLL_IDLE_BACKOFF", "200"))  # sau N lần trống → back-off 0.5s
+FAST_POLL_IDLE_BACKOFF = int(os.getenv("FAST_POLL_IDLE_BACKOFF", "200"))
 GLOBAL_DEDUP_TTL   = int(os.getenv("GLOBAL_DEDUP_TTL", 86400))     # 24h
 
 SERVER_START_TIME = time.time()
@@ -81,15 +81,9 @@ class AsyncLoopManager:
         return future.result(timeout=timeout)
 
     def submit_task(self, coro):
-        """Schedule a long-running coroutine as a Task (non-blocking)."""
         if not self._started or not self.loop:
             raise RuntimeError("AsyncLoopManager chưa start!")
         return asyncio.run_coroutine_threadsafe(coro, self.loop)
-
-    def stop(self):
-        if self.loop:
-            self.loop.call_soon_threadsafe(self.loop.stop)
-            self._started = False
 
 
 async_manager = AsyncLoopManager()
@@ -517,7 +511,6 @@ def mark_redeemed_global(code):
 
 
 def _try_claim_code(session_id, variants):
-    """Atomically claim code for redemption. Returns True nếu claim được."""
     with SESSIONS_LOCK:
         s = sessions.get(session_id)
         if not s:
@@ -536,14 +529,16 @@ def _try_claim_code(session_id, variants):
 
 
 # ================================================================
-#             REDEEM ENGINE — FAST, PARALLEL, NO-RETRY
+#             REDEEM ENGINE — FAST, PARALLEL
 # ================================================================
 _fast_session = requests.Session()
 _fast_session.headers.update({
-    "user-agent": "Mozilla/5.0",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "origin": "https://lc79.to",
     "referer": "https://lc79.to/",
     "accept": "application/json, text/plain, */*",
+    "accept-language": "vi-VN,vi;q=0.9,en;q=0.8",
+    "connection": "keep-alive"
 })
 
 
@@ -556,7 +551,6 @@ def _warm_redeem_connection():
 
 
 def code_variants(raw):
-    """Variant dùng cho manual + fetch (giữ nguyên format gốc)."""
     if not raw:
         return []
     raw = raw.strip().upper()
@@ -570,11 +564,7 @@ def code_variants(raw):
 
 
 def code_variants_auto(raw):
-    """Variant AUTO-REDEEM: BỎ prefix LC79 (4 ký tự) ở đầu.
-
-    Khi auto nhập code (event handler hoặc force scan), API game mong
-    code không có prefix LC79. Nếu code không bắt đầu bằng LC79 → giữ nguyên.
-    """
+    """Bỏ hoàn toàn 4 chữ LC79 ở đầu cho Auto."""
     if not raw:
         return []
     raw = raw.strip().upper()
@@ -612,7 +602,7 @@ def _single_redeem(account, code):
         resp = _fast_session.post(
             REDEEM_BASE_URL + REDEEM_PARAMS,
             headers=headers, json={"code": code, "captcha": ""},
-            timeout=(3, 8),
+            timeout=(3, 10), # Tăng read timeout lên 10s để đợi server game xử lý
         )
         elapsed = time.time() - start
         try:
@@ -670,9 +660,9 @@ def redeem_code_fast(account, candidates):
 
 
 # ================================================================
-#        PERSISTENT SESSION STORAGE (survive restart / reload)
+#        PERSISTENT SESSION STORAGE
 # ================================================================
-persistent_sessions = {}  # persist_token -> {...}
+persistent_sessions = {}
 PERSIST_LOCK = threading.Lock()
 _persist_dirty = False
 
@@ -683,12 +673,10 @@ def _load_persist():
         if os.path.exists(PERSIST_FILE):
             with open(PERSIST_FILE, "r") as f:
                 persistent_sessions = json.load(f)
-            # Rebuild global dedup set từ redeemed_codes đã lưu
             for token, p in persistent_sessions.items():
                 for c in p.get("redeemed_codes", []):
                     mark_redeemed_global(c)
-            logger.info(f"📂 Loaded {len(persistent_sessions)} persistent session(s) "
-                        f"+ {len(_redeemed_global)} redeemed code(s)")
+            logger.info(f"📂 Loaded {len(persistent_sessions)} persistent session(s)")
     except Exception as e:
         logger.warning(f"load_persist: {e}")
         persistent_sessions = {}
@@ -727,7 +715,6 @@ def _mark_dirty():
 
 
 def _create_persist_token(session_data):
-    """Gọi sau khi OTP/2FA thành công. Lưu StringSession + api_id/hash."""
     try:
         client = session_data["client"]
         if not client.is_connected():
@@ -763,10 +750,9 @@ def _create_persist_token(session_data):
     return token
 
 
-# ============ TELEGRAM SESSION STORAGE (in-memory) ============
+# ============ TELEGRAM SESSION STORAGE ============
 sessions = {}
 SESSIONS_LOCK = threading.Lock()
-SESSION_TTL = 86400
 
 
 def cleanup_old_sessions():
@@ -799,7 +785,6 @@ def cleanup_old_sessions():
 
 
 def _persist_saver_loop():
-    """Định kỳ sync redeemed_codes từ session → persist file (mỗi 60s nếu dirty)."""
     while True:
         try:
             time.sleep(60)
@@ -814,7 +799,6 @@ def _persist_saver_loop():
                     if pt in persistent_sessions:
                         persistent_sessions[pt]["redeemed_codes"] = s["redeemed_codes"][-500:]
             _save_persist()
-            logger.info("💾 Persist synced (redeemed_codes)")
         except Exception as e:
             logger.warning(f"persist_saver: {e}")
 
@@ -991,9 +975,7 @@ def _add_auto_event(session_id, event):
 
 
 def _auto_redeem_worker(session_id, candidates, raw_code, msg_ts):
-    """Fire redeem 1 lần cho 1 code. Dùng _try_claim_code để atomic dedup."""
     try:
-        # Atomic claim — tránh 2 thread (event + poll) fire trùng
         if not _try_claim_code(session_id, candidates):
             return
         _mark_dirty()
@@ -1004,29 +986,15 @@ def _auto_redeem_worker(session_id, candidates, raw_code, msg_ts):
             return
         username = s.get("game_username")
         if not username:
-            _add_auto_event(session_id, {
-                "ts": time.time(), "code": candidates[0] if candidates else raw_code,
-                "raw_code": raw_code,
-                "status": "skipped", "message": "Chưa login game",
-                "msg_ts": msg_ts,
-                "delay_ms": int((time.time() - msg_ts) * 1000),
-            })
             return
+
         account = account_manager.get(username)
         if not account:
-            _add_auto_event(session_id, {
-                "ts": time.time(), "code": candidates[0] if candidates else raw_code,
-                "raw_code": raw_code,
-                "status": "skipped", "message": "Account không tồn tại",
-                "msg_ts": msg_ts,
-                "delay_ms": int((time.time() - msg_ts) * 1000),
-            })
             return
 
         fire_ts = time.time()
         api_logger.log("info",
-                       f"⚡ Auto-redeem: {candidates[0] if candidates else raw_code} "
-                       f"(raw={raw_code})",
+                       f"⚡ Auto-redeem: {candidates[0]} (raw={raw_code})",
                        account=username, candidates=candidates)
         result = redeem_code_fast(account, candidates)
         elapsed = time.time() - fire_ts
@@ -1054,8 +1022,7 @@ def _auto_redeem_worker(session_id, candidates, raw_code, msg_ts):
             "amount": amount, "message": msg,
         })
         api_logger.log("success" if is_ok else "error",
-                       f"Redeem {candidates[0] if candidates else raw_code}: "
-                       f"HTTP {http} ({int(elapsed*1000)}ms)",
+                       f"Redeem {candidates[0]}: HTTP {http} ({int(elapsed*1000)}ms)",
                        account=username)
     except Exception as e:
         logger.error(f"_auto_redeem_worker err: {e}")
@@ -1065,14 +1032,6 @@ def _auto_redeem_worker(session_id, candidates, raw_code, msg_ts):
 #              FAST POLL LOOP — 0.1s REAL-TIME BACKUP
 # ================================================================
 async def _fast_poll_loop(session_id):
-    """Poll tin nhắn mới mỗi 0.1s — backup cho event handler.
-
-    - Event handler là primary (push, ~50ms latency).
-    - Fast-poll là secondary (0.1s) → bắt kịp khi event bị miss
-      (reconnect, server restart, disconnect tạm thời).
-    - Tự back-off 0.5s sau 200 lần trống (idle) → giảm tải Telegram.
-    - Reset về 0.1s khi có tin mới hoặc event handler fire.
-    """
     logger.info(f"⚡ Fast-poll ON (interval={FAST_POLL_INTERVAL}s) for session {session_id[:8]}")
 
     with SESSIONS_LOCK:
@@ -1089,7 +1048,6 @@ async def _fast_poll_loop(session_id):
             return
         s["auto_watch_channel"] = channel_entity
 
-    # Khởi tạo last_seen_id từ message mới nhất
     last_seen_id = 0
     try:
         msgs = await client.get_messages(channel_entity, limit=1)
@@ -1101,12 +1059,10 @@ async def _fast_poll_loop(session_id):
     consecutive_empty = 0
 
     while True:
-        # Kiểm tra session còn active không
         with SESSIONS_LOCK:
             s = sessions.get(session_id)
             if not s or not s.get("auto_watch_handler"):
                 break
-        # Kiểm tra client
         if not client.is_connected():
             try:
                 await client.connect()
@@ -1122,7 +1078,6 @@ async def _fast_poll_loop(session_id):
             )
             if msgs:
                 consecutive_empty = 0
-                # Xử lý từ cũ → mới
                 for msg in reversed(msgs):
                     last_seen_id = max(last_seen_id, msg.id)
                     text = msg.message or ""
@@ -1130,7 +1085,6 @@ async def _fast_poll_loop(session_id):
                         variants = code_variants_auto(raw)
                         if not variants:
                             continue
-                        # Fire ngay, worker sẽ tự dedup
                         threading.Thread(
                             target=_auto_redeem_worker,
                             args=(session_id, variants, raw, time.time()),
@@ -1150,7 +1104,6 @@ async def _fast_poll_loop(session_id):
             await asyncio.sleep(1.0)
             continue
 
-        # Adaptive backoff khi idle lâu
         if consecutive_empty > FAST_POLL_IDLE_BACKOFF:
             await asyncio.sleep(0.5)
         else:
@@ -1218,7 +1171,6 @@ async def _async_start_auto_watch(session_id):
     except Exception:
         pass
 
-    # === EVENT HANDLER (primary, instant push) ===
     async def on_new_msg(event):
         try:
             text = event.raw_text or ""
@@ -1241,7 +1193,6 @@ async def _async_start_auto_watch(session_id):
     s["auto_watch_handler"] = on_new_msg
     s["auto_watch_channel"] = channel_entity
 
-    # === FAST POLL (secondary, 0.1s safety net) ===
     try:
         task_future = async_manager.submit_task(_fast_poll_loop(session_id))
         s["fast_poll_task"] = task_future
@@ -1249,10 +1200,8 @@ async def _async_start_auto_watch(session_id):
         logger.warning(f"cannot start fast-poll: {e}")
 
     threading.Thread(target=_warm_redeem_connection, daemon=True).start()
-    logger.info(f"🎯 Auto-watch ON (event + {FAST_POLL_INTERVAL}s poll): "
-                f"{session_id[:8]} / {username}")
-    return {"status": "ok", "username": username,
-            "poll_interval": FAST_POLL_INTERVAL}
+    logger.info(f"🎯 Auto-watch ON: {session_id[:8]} / {username}")
+    return {"status": "ok", "username": username, "poll_interval": FAST_POLL_INTERVAL}
 
 
 async def _async_stop_auto_watch(session_id):
@@ -1271,7 +1220,6 @@ async def _async_stop_auto_watch(session_id):
     s["auto_watch_handler"] = None
     s["auto_watch_channel"] = None
 
-    # Cancel fast poll
     task_future = s.get("fast_poll_task")
     if task_future:
         try:
@@ -1285,7 +1233,6 @@ async def _async_stop_auto_watch(session_id):
 
 
 async def _async_force_scan(session_id):
-    """Quét 20 tin gần nhất, fire các code chưa redeem (dùng code_variants_auto)."""
     with SESSIONS_LOCK:
         s = sessions.get(session_id)
     if not s:
@@ -1314,7 +1261,6 @@ async def _async_force_scan(session_id):
         text = msg.message or ""
         for raw in extract_code_candidates(text):
             variants = code_variants_auto(raw)
-            # Check claim trước để tránh fire trùng
             with SESSIONS_LOCK:
                 redeemed = s.get("redeemed_codes", [])
             if any(v in redeemed for v in variants):
@@ -1373,7 +1319,6 @@ def jwt_prewarm_loop():
 
 
 def session_keepalive_loop():
-    """Reconnect client nếu auto-watch session bị mất kết nối."""
     time.sleep(30)
     while True:
         try:
@@ -1396,7 +1341,6 @@ def session_keepalive_loop():
 
 
 def restore_persistent_sessions_loop():
-    """Restore mọi session có auto_enabled khi server khởi động lại."""
     time.sleep(10)
     with PERSIST_LOCK:
         items = [(t, dict(p)) for t, p in persistent_sessions.items()
@@ -1404,7 +1348,7 @@ def restore_persistent_sessions_loop():
     if not items:
         logger.info("♻️ No persistent sessions to restore")
         return
-    logger.info(f"♻️ Restoring {len(items)} persistent session(s) + auto-watch...")
+    logger.info(f"♻️ Restoring {len(items)} persistent session(s)...")
     for token, p in items:
         try:
             async def _restore(token=token, p=p):
@@ -1450,7 +1394,7 @@ def restore_persistent_sessions_loop():
                 return new_sid
             new_sid = async_manager.run(_restore(), timeout=90)
             if new_sid:
-                logger.info(f"♻️ Restored {token[:8]} -> {new_sid[:8]} (auto-watch resumed)")
+                logger.info(f"♻️ Restored {token[:8]} -> {new_sid[:8]}")
         except Exception as e:
             logger.warning(f"restore {token[:8]} fail: {e}")
 
@@ -1494,21 +1438,18 @@ def api_send_code():
             if client and client.is_connected():
                 try: await client.disconnect()
                 except Exception: pass
-            return {"status": "error",
-                    "message": "SĐT không hợp lệ. Nhập dạng +84987654321."}
+            return {"status": "error", "message": "SĐT không hợp lệ. Nhập dạng +84987654321."}
         except FloodWaitError as e:
             if client and client.is_connected():
                 try: await client.disconnect()
                 except Exception: pass
-            return {"status": "error",
-                    "message": f"Telegram giới hạn, chờ {e.seconds}s."}
+            return {"status": "error", "message": f"Telegram giới hạn, chờ {e.seconds}s."}
         except Exception as e:
             if client and client.is_connected():
                 try: await client.disconnect()
                 except Exception: pass
             logger.error(f"send_code err: {type(e).__name__}: {e}")
-            return {"status": "error",
-                    "message": f"Lỗi: {type(e).__name__}: {e}"}
+            return {"status": "error", "message": f"Lỗi: {type(e).__name__}: {e}"}
 
     try:
         result = async_manager.run(_do(), timeout=45)
@@ -1556,8 +1497,7 @@ def api_verify_code():
         except AuthRestartError:
             return {"status": "error", "message": "Telegram yêu cầu restart."}
         except Exception as e:
-            return {"status": "error",
-                    "message": f"Lỗi: {type(e).__name__}: {str(e)[:200]}"}
+            return {"status": "error", "message": f"Lỗi: {type(e).__name__}: {str(e)[:200]}"}
 
     try:
         result = async_manager.run(_do(), timeout=45)
@@ -1611,8 +1551,7 @@ def api_login_game():
     session_id = data.get("session_id")
     persist_token = data.get("persist_token")
     if not username or not password:
-        return jsonify({"status": "error",
-                        "message": "Vui lòng nhập đủ Username và Mật khẩu."})
+        return jsonify({"status": "error", "message": "Vui lòng nhập đủ Username và Mật khẩu."})
     result = login_game_sync(username, password)
 
     if result.get("status") == "ok":
@@ -1729,11 +1668,6 @@ def api_refresh_jwt():
 
 @flask_app.route("/api/resume", methods=["POST"])
 def api_resume():
-    """Khôi phục phiên + auto-watch + fast-poll từ persist_token.
-
-    Không cần reset web — reload page là auto resume.
-    Server restart → restore_persistent_sessions_loop tự bật lại.
-    """
     data = request.json or {}
     persist_token = data.get("persist_token")
     if not persist_token:
@@ -1743,7 +1677,6 @@ def api_resume():
     if not p:
         return jsonify({"status": "not_found", "message": "Token không tồn tại"})
 
-    # Reuse nếu đã có session active
     with SESSIONS_LOCK:
         active_sid = None
         for sid, s in sessions.items():
@@ -1809,7 +1742,6 @@ def api_resume():
             return jsonify(result)
         sid = result["session_id"]
 
-    # Đảm bảo auto-watch + fast-poll chạy nếu đã bật
     if p.get("auto_enabled") and p.get("game_username"):
         try:
             async_manager.run(_async_start_auto_watch(sid), timeout=30)
@@ -1893,7 +1825,6 @@ def api_redeem_manual():
     if not acc:
         return jsonify({"status": "error", "message": "Không tìm thấy account"})
 
-    # Manual: dùng code_variants (thử cả 2 format) để an toàn
     variants = code_variants(code_input)
     start = time.time()
     result = redeem_code_fast(acc, variants)
@@ -2190,7 +2121,7 @@ body>*{position:relative;z-index:1}
       <div style="font-size:13px;color:var(--muted);margin-bottom:24px;line-height:1.6">
         Đăng nhập 1 lần — dùng mãi mãi<br>
         <strong style="color:var(--accent2)">⚡ Event + Fast-poll 0.1s</strong><br>
-        <strong style="color:var(--success)">💾 Session tự lưu, không cần reset web</strong><br>
+        <strong style="color:var(--success)">💾 Tự cập nhật code mới không cần F5</strong><br>
         <strong style="color:var(--warning)">🔁 Auto-restore sau server restart</strong>
       </div>
     </div>
@@ -2313,7 +2244,7 @@ body>*{position:relative;z-index:1}
     <div class="auto-toggle-row">
       <div class="auto-info">
         <div class="auto-title">Auto Watch + Redeem
-          <span class="realtime-badge"><span class="dot"></span>REAL-TIME 0.1s</span>
+          <span class="realtime-badge"><span class="dot"></span>REAL-TIME</span>
         </div>
         <div class="auto-status" id="auto-status">⚪ Chưa bật</div>
       </div>
@@ -2639,7 +2570,7 @@ async function toggleAuto() {
     const data = await res.json();
     if (data.status === 'ok') {
       setAutoState(!isOn);
-      toast(!isOn ? '🎯 Đã bật Auto — Event + Poll 0.1s đang chạy' : '🛑 Đã tắt Auto Watch');
+      toast(!isOn ? '🎯 Đã bật Auto — Event + Poll đang chạy' : '🛑 Đã tắt Auto Watch');
     } else { toast('Lỗi: ' + (data.message || 'unknown')); }
   } catch (e) { toast('Lỗi kết nối server'); }
   finally { btn.disabled = false; }
@@ -2651,7 +2582,7 @@ function setAutoState(on) {
   btn.dataset.state = on ? 'on' : 'off';
   btn.textContent = on ? 'TẮT' : 'BẬT';
   document.getElementById('auto-status').textContent = on
-    ? `🟢 Đang theo dõi realtime (event + poll ${state.pollInterval}s)`
+    ? `🟢 Đang theo dõi realtime (event + poll)`
     : '⚪ Chưa bật';
 }
 
@@ -2696,14 +2627,23 @@ async function refreshAutoEvents() {
   } catch (e) {}
 }
 
-async function fetchCodes() {
+let lastCodesHash = '';
+
+async function fetchCodes(silent = false) {
   const container = document.getElementById('codes-container');
-  container.innerHTML = '<div style="text-align:center;color:var(--muted);padding:20px">Đang quét kênh LC79...</div>';
+  if (!silent) {
+    container.innerHTML = '<div style="text-align:center;color:var(--muted);padding:20px">Đang quét kênh LC79...</div>';
+  }
   try {
     const res = await fetch('/api/get_codes', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session_id: state.session_id})});
     const data = await res.json();
     if (data.status === 'ok' && data.items && data.items.length > 0) {
       state.codes = data.items.map(it => it.code);
+      
+      const newHash = JSON.stringify(data.items.map(it => it.code));
+      if (silent && newHash === lastCodesHash) return; // Không vẽ lại nếu không có code mới
+      lastCodesHash = newHash;
+
       container.innerHTML = '';
       data.items.forEach((item, i) => {
         const div = document.createElement('div');
@@ -2721,8 +2661,8 @@ async function fetchCodes() {
       container.innerHTML = `<div style="color:var(--danger);text-align:center;padding:20px">${data.message || 'Lỗi'}</div>`;
       state.codes = [];
     }
-  } catch (e) { container.innerHTML = '<div style="color:var(--danger);text-align:center;padding:20px">Lỗi kết nối!</div>'; }
-  await refreshStats();
+  } catch (e) { if(!silent) container.innerHTML = '<div style="color:var(--danger);text-align:center;padding:20px">Lỗi kết nối!</div>'; }
+  if (!silent) await refreshStats();
 }
 
 function copyCode(text) { navigator.clipboard.writeText(text).then(() => toast('Đã copy: ' + text)); }
@@ -2852,12 +2792,15 @@ document.getElementById('otpCode')?.addEventListener('keypress', e => { if (e.ke
 document.getElementById('password2fa')?.addEventListener('keypress', e => { if (e.key === 'Enter') verify2FA(); });
 document.getElementById('manualCode')?.addEventListener('keypress', e => { if (e.key === 'Enter') redeemManual(); });
 
-// Poll auto status every 1.5s while on dashboard
+// Vòng lặp cập nhật Real-time (2s): Log auto + Danh sách Giftcode không cần F5
 setInterval(() => {
   if (document.getElementById('view-result').classList.contains('active') && state.session_id) {
     refreshAutoEvents();
+    if (state.autoEnabled) {
+      fetchCodes(true); // Silent fetch để lấy danh sách code mới
+    }
   }
-}, 1500);
+}, 2000);
 
 // Auto-resume on page load
 (async () => {
