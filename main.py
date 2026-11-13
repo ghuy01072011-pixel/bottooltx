@@ -10,6 +10,7 @@ import hashlib
 import base64
 import uuid
 from flask import Flask, Response, request, jsonify
+from requests.adapters import HTTPAdapter
 
 from telethon import TelegramClient, functions, events
 from telethon.sessions import StringSession
@@ -490,9 +491,9 @@ account_manager = GameAccountManager(api_client, api_logger)
 
 
 # ================================================================
-#             GLOBAL REDEEM DEDUP (cross-session, cross-restart)
+#             GLOBAL REDEEM DEDUP
 # ================================================================
-_redeemed_global = {}   # code -> ts
+_redeemed_global = {}
 _redeemed_lock = threading.Lock()
 
 
@@ -529,16 +530,21 @@ def _try_claim_code(session_id, variants):
 
 
 # ================================================================
-#             REDEEM ENGINE — FAST, PARALLEL
+#          REDEEM ENGINE — ULTRA FAST & PARALLEL
 # ================================================================
+# TỐI ƯU SIÊU TỐC: Tăng Connection Pool lên 1000 để bắn không giới hạn
+_adapter = HTTPAdapter(pool_connections=1000, pool_maxsize=1000, max_retries=0)
 _fast_session = requests.Session()
+_fast_session.mount("https://", _adapter)
+_fast_session.mount("http://", _adapter)
+
 _fast_session.headers.update({
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "origin": "https://lc79.to",
     "referer": "https://lc79.to/",
     "accept": "application/json, text/plain, */*",
     "accept-language": "vi-VN,vi;q=0.9,en;q=0.8",
-    "connection": "keep-alive"
+    "connection": "keep-alive" # Giữ kết nối TCP liên tục
 })
 
 
@@ -564,7 +570,7 @@ def code_variants(raw):
 
 
 def code_variants_auto(raw):
-    """Bỏ hoàn toàn 4 chữ LC79 ở đầu cho Auto."""
+    """CHỈ TRẢ VỀ MÃ ĐÃ BỎ LC79 (Như yêu cầu: CAITFOPNM)"""
     if not raw:
         return []
     raw = raw.strip().upper()
@@ -602,7 +608,7 @@ def _single_redeem(account, code):
         resp = _fast_session.post(
             REDEEM_BASE_URL + REDEEM_PARAMS,
             headers=headers, json={"code": code, "captcha": ""},
-            timeout=(3, 10), # Tăng read timeout lên 10s để đợi server game xử lý
+            timeout=(1.5, 4.5), # Ép timeout ngắn để không bị treo
         )
         elapsed = time.time() - start
         try:
@@ -630,33 +636,9 @@ def redeem_code_fast(account, candidates):
         if r.get("status") != "ok":
             return {"status": "error", "http": 0,
                     "message": "JWT invalid: " + r.get("message", "")}
-    if len(candidates) == 1:
-        return _single_redeem(account, candidates[0])
-
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    ex = ThreadPoolExecutor(max_workers=len(candidates))
-    futures = [ex.submit(_single_redeem, account, c) for c in candidates]
-    winner = None
-    try:
-        for f in as_completed(futures):
-            try:
-                r = f.result()
-            except Exception:
-                continue
-            if r.get("http") in (200, 201):
-                winner = r
-                break
-    finally:
-        ex.shutdown(wait=False)
-    if winner:
-        return winner
-    for f in futures:
-        if f.done() and not f.cancelled():
-            try:
-                return f.result()
-            except Exception:
-                pass
-    return {"status": "error", "http": 0, "message": "all attempts failed"}
+    
+    # Auto luôn chỉ trả về 1 mã, bắn thẳng không qua vòng lặp
+    return _single_redeem(account, candidates[0])
 
 
 # ================================================================
@@ -993,8 +975,9 @@ def _auto_redeem_worker(session_id, candidates, raw_code, msg_ts):
             return
 
         fire_ts = time.time()
+        code_to_fire = candidates[0] # Mã đã bỏ LC79
         api_logger.log("info",
-                       f"⚡ Auto-redeem: {candidates[0]} (raw={raw_code})",
+                       f"⚡ Siêu tốc: {code_to_fire} (raw={raw_code})",
                        account=username, candidates=candidates)
         result = redeem_code_fast(account, candidates)
         elapsed = time.time() - fire_ts
@@ -1012,7 +995,7 @@ def _auto_redeem_worker(session_id, candidates, raw_code, msg_ts):
 
         _add_auto_event(session_id, {
             "ts": fire_ts, "msg_ts": msg_ts,
-            "code": candidates[0] if candidates else raw_code,
+            "code": code_to_fire,
             "raw_code": raw_code,
             "candidates": candidates, "http": http,
             "elapsed_ms": int(elapsed * 1000),
@@ -1022,7 +1005,7 @@ def _auto_redeem_worker(session_id, candidates, raw_code, msg_ts):
             "amount": amount, "message": msg,
         })
         api_logger.log("success" if is_ok else "error",
-                       f"Redeem {candidates[0]}: HTTP {http} ({int(elapsed*1000)}ms)",
+                       f"Redeem {code_to_fire}: HTTP {http} ({int(elapsed*1000)}ms)",
                        account=username)
     except Exception as e:
         logger.error(f"_auto_redeem_worker err: {e}")
@@ -1969,27 +1952,27 @@ def api_stats():
 
 
 # ================================================================
-#                    WEB UI
+#                    WEB UI (LIGHT THEME)
 # ================================================================
 MAIN_HTML = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-<meta name="theme-color" content="#05050a">
+<meta name="theme-color" content="#f1f5f9">
 <title>Auto Tool VIP — Real-time 24/7</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
 :root{
-  --bg:#05050a; --card:rgba(20,24,39,0.6);
-  --accent:#8b5cf6; --accent-glow:rgba(139,92,246,0.4);
-  --accent2:#06b6d4; --text:#f8fafc; --muted:#94a3b8;
-  --border:rgba(255,255,255,0.08); --danger:#ef4444; --success:#10b981;
+  --bg:#f1f5f9; --card:#ffffff;
+  --accent:#4f46e5; --accent-glow:rgba(79,70,229,0.2);
+  --accent2:#0ea5e9; --text:#1e293b; --muted:#64748b;
+  --border:#e2e8f0; --danger:#ef4444; --success:#10b981;
   --warning:#f59e0b;
 }
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html,body{touch-action:pan-x pan-y;height:100%}
-body{font-family:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding:20px 16px 60px;overflow-x:hidden;background-image:radial-gradient(circle at 0% 0%,rgba(139,92,246,0.15) 0%,transparent 50%),radial-gradient(circle at 100% 100%,rgba(6,182,212,0.15) 0%,transparent 50%);background-attachment:fixed}
+body{font-family:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding:20px 16px 60px;overflow-x:hidden}
 body>*{position:relative;z-index:1}
 .icon{width:24px;height:24px;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;fill:none}
 .icon-sm{width:18px;height:18px}
@@ -1998,111 +1981,111 @@ body>*{position:relative;z-index:1}
 .view.active{display:block}
 @keyframes viewIn{from{opacity:0;transform:translateY(15px) scale(0.98)}to{opacity:1;transform:none}}
 .header{text-align:center;padding:30px 0 20px}
-.logo{display:inline-flex;align-items:center;justify-content:center;width:80px;height:80px;border-radius:24px;background:linear-gradient(135deg,rgba(139,92,246,0.2),rgba(6,182,212,0.2));border:1px solid rgba(139,92,246,0.4);color:var(--accent);margin-bottom:20px;box-shadow:0 10px 40px rgba(139,92,246,0.2);backdrop-filter:blur(10px)}
-.header h1{font-size:26px;font-weight:800;letter-spacing:-0.8px;margin-bottom:8px}
-.header h1 span{background:linear-gradient(to right,#a78bfa,#22d3ee);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.logo{display:inline-flex;align-items:center;justify-content:center;width:80px;height:80px;border-radius:24px;background:linear-gradient(135deg,rgba(79,70,229,0.1),rgba(14,165,233,0.1));border:1px solid rgba(79,70,229,0.2);color:var(--accent);margin-bottom:20px;box-shadow:0 10px 40px rgba(79,70,229,0.1)}
+.header h1{font-size:26px;font-weight:800;letter-spacing:-0.8px;margin-bottom:8px;color:#0f172a}
+.header h1 span{background:linear-gradient(to right,#4f46e5,#0ea5e9);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .header p{color:var(--muted);font-size:14px;font-weight:500}
 .steps{display:flex;justify-content:center;gap:6px;margin:20px 0 24px;flex-wrap:wrap}
-.step-dot{width:28px;height:28px;border-radius:50%;background:rgba(255,255,255,0.05);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;color:var(--muted);transition:0.3s}
+.step-dot{width:28px;height:28px;border-radius:50%;background:#e2e8f0;border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;color:var(--muted);transition:0.3s}
 .step-dot.done{background:var(--success);border-color:var(--success);color:#fff}
 .step-dot.active{background:var(--accent);border-color:var(--accent);color:#fff;box-shadow:0 0 15px var(--accent-glow)}
 .section-title{font-size:13px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px;margin:24px 4px 16px;display:flex;align-items:center;gap:8px}
 .section-title::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,var(--border),transparent)}
-.lc-header{background:linear-gradient(135deg,rgba(30,35,55,0.8),rgba(20,24,39,0.6));border:1px solid var(--border);border-radius:24px;padding:32px 20px;margin-bottom:20px;text-align:center;backdrop-filter:blur(12px);position:relative;overflow:hidden}
-.lc-header::before{content:'';position:absolute;top:0;left:0;width:100%;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent)}
-.lc-icon{display:inline-flex;align-items:center;justify-content:center;width:64px;height:64px;border-radius:20px;background:rgba(139,92,246,0.15);color:var(--accent);margin-bottom:16px;border:1px solid rgba(139,92,246,0.3)}
-.lc-header h2{font-size:22px;font-weight:800;margin-bottom:8px;letter-spacing:-0.5px}
+.lc-header{background:#ffffff;border:1px solid var(--border);border-radius:24px;padding:32px 20px;margin-bottom:20px;text-align:center;position:relative;overflow:hidden;box-shadow:0 4px 6px -1px rgba(0,0,0,0.02), 0 2px 4px -1px rgba(0,0,0,0.02)}
+.lc-header::before{content:'';position:absolute;top:0;left:0;width:100%;height:3px;background:linear-gradient(90deg,transparent,var(--accent),transparent)}
+.lc-icon{display:inline-flex;align-items:center;justify-content:center;width:64px;height:64px;border-radius:20px;background:rgba(79,70,229,0.08);color:var(--accent);margin-bottom:16px;border:1px solid rgba(79,70,229,0.15)}
+.lc-header h2{font-size:22px;font-weight:800;margin-bottom:8px;letter-spacing:-0.5px;color:#0f172a}
 .lc-header p{font-size:13px;color:var(--muted);font-weight:500}
-.panel{background:var(--card);border:1px solid var(--border);border-radius:24px;padding:24px 20px;backdrop-filter:blur(12px)}
+.panel{background:var(--card);border:1px solid var(--border);border-radius:24px;padding:24px 20px;box-shadow:0 4px 6px -1px rgba(0,0,0,0.02)}
 .panel label{font-size:12px;font-weight:700;color:var(--muted);display:flex;align-items:center;gap:6px;margin-bottom:10px;text-transform:uppercase;letter-spacing:0.5px}
-.panel input{width:100%;background:rgba(0,0,0,0.3);border:1px solid var(--border);border-radius:14px;padding:16px;color:var(--text);font-size:15px;font-weight:500;outline:none;transition:0.3s;margin-bottom:20px;font-family:inherit}
-.panel input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(139,92,246,0.15);background:rgba(0,0,0,0.5)}
-.panel input::placeholder{color:rgba(148,163,184,0.5)}
-.btn{width:100%;padding:16px;border:none;border-radius:14px;font-size:16px;font-weight:700;cursor:pointer;transition:0.2s;display:flex;align-items:center;justify-content:center;gap:8px;color:#fff;background:linear-gradient(135deg,#8b5cf6,#6366f1);box-shadow:0 8px 24px var(--accent-glow);font-family:inherit}
+.panel input{width:100%;background:#f8fafc;border:1px solid var(--border);border-radius:14px;padding:16px;color:var(--text);font-size:15px;font-weight:500;outline:none;transition:0.3s;margin-bottom:20px;font-family:inherit}
+.panel input:focus{border-color:var(--accent);box-shadow:0 0 0 4px rgba(79,70,229,0.1);background:#ffffff}
+.panel input::placeholder{color:#cbd5e1}
+.btn{width:100%;padding:16px;border:none;border-radius:14px;font-size:16px;font-weight:700;cursor:pointer;transition:0.2s;display:flex;align-items:center;justify-content:center;gap:8px;color:#fff;background:linear-gradient(135deg,#4f46e5,#6366f1);box-shadow:0 4px 12px var(--accent-glow);font-family:inherit}
 .btn:active{transform:scale(0.97);box-shadow:none}
 .btn:disabled{opacity:0.6;pointer-events:none}
-.btn-ghost{background:rgba(255,255,255,0.05);border:1px solid var(--border);box-shadow:none}
-.btn-danger{background:linear-gradient(135deg,#ef4444,#dc2626);box-shadow:0 8px 24px rgba(239,68,68,0.4)}
-.btn-success{background:linear-gradient(135deg,#10b981,#059669);box-shadow:0 8px 24px rgba(16,185,129,0.4)}
-.btn-warning{background:linear-gradient(135deg,#f59e0b,#d97706);box-shadow:0 8px 24px rgba(245,158,11,0.4)}
+.btn-ghost{background:#ffffff;border:1px solid var(--border);box-shadow:none;color:var(--text)}
+.btn-danger{background:linear-gradient(135deg,#ef4444,#dc2626);box-shadow:0 4px 12px rgba(239,68,68,0.3)}
+.btn-success{background:linear-gradient(135deg,#10b981,#059669);box-shadow:0 4px 12px rgba(16,185,129,0.3)}
+.btn-warning{background:linear-gradient(135deg,#f59e0b,#d97706);box-shadow:0 4px 12px rgba(245,158,11,0.3)}
 .alert{padding:14px 16px;border-radius:12px;font-size:13px;font-weight:600;margin-bottom:16px;display:none;line-height:1.5}
 .alert.show{display:block}
-.alert-err{background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#fca5a5}
-.alert-ok{background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.3);color:#6ee7b7}
-.code-box{background:rgba(0,0,0,0.3);border:1px solid rgba(16,185,129,0.3);border-radius:12px;padding:14px 16px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;gap:12px}
+.alert-err{background:#fef2f2;border:1px solid #fecaca;color:#b91c1c}
+.alert-ok{background:#ecfdf5;border:1px solid #a7f3d0;color:#047857}
+.code-box{background:#ffffff;border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;gap:12px;box-shadow:0 1px 2px rgba(0,0,0,0.02)}
 .code-box .code-content{flex:1;min-width:0}
-.code-box .code-main{font-family:'Courier New',monospace;font-size:16px;color:#34d399;font-weight:800;letter-spacing:1.5px;word-break:break-all}
+.code-box .code-main{font-family:'Courier New',monospace;font-size:16px;color:#059669;font-weight:800;letter-spacing:1.5px;word-break:break-all}
 .code-box .code-meta{font-size:11px;color:var(--muted);margin-top:4px;letter-spacing:0;font-weight:600}
 .code-badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:9px;font-weight:800;margin-left:6px;letter-spacing:0.5px;vertical-align:middle}
-.code-badge.new{background:rgba(16,185,129,0.2);color:var(--success)}
-.code-badge.seen{background:rgba(148,163,184,0.2);color:var(--muted)}
-.copy-btn{background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.3);color:#34d399;padding:8px 12px;border-radius:8px;cursor:pointer;font-weight:700;font-size:11px;transition:0.2s;font-family:inherit;flex-shrink:0}
-.copy-btn:active{background:#10b981;color:#000}
-.info-card{background:linear-gradient(135deg,rgba(139,92,246,0.1),rgba(6,182,212,0.05));border:1px solid rgba(139,92,246,0.3);border-radius:20px;padding:20px;margin-bottom:16px}
+.code-badge.new{background:#ecfdf5;color:#059669;border:1px solid #a7f3d0}
+.code-badge.seen{background:#f1f5f9;color:#64748b;border:1px solid #e2e8f0}
+.copy-btn{background:#ecfdf5;border:1px solid #a7f3d0;color:#059669;padding:8px 12px;border-radius:8px;cursor:pointer;font-weight:700;font-size:11px;transition:0.2s;font-family:inherit;flex-shrink:0}
+.copy-btn:active{background:#10b981;color:#fff}
+.info-card{background:#ffffff;border:1px solid var(--border);border-radius:20px;padding:20px;margin-bottom:16px;box-shadow:0 2px 4px rgba(0,0,0,0.02)}
 .info-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);gap:10px}
 .info-row:last-child{border-bottom:none;padding-bottom:0}
 .info-row:first-child{padding-top:0}
 .info-label{color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.8px;flex-shrink:0}
-.info-value{font-size:14px;font-weight:800;text-align:right;word-break:break-all}
+.info-value{font-size:14px;font-weight:800;text-align:right;word-break:break-all;color:#0f172a}
 .token-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}
 @media(max-width:420px){.token-grid{grid-template-columns:1fr}}
-.token-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px}
-.token-card.ok{border-color:rgba(16,185,129,0.4)}
-.token-card.err{border-color:rgba(239,68,68,0.4)}
+.token-card{background:#ffffff;border:1px solid var(--border);border-radius:16px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,0.02)}
+.token-card.ok{border-color:#a7f3d0;background:#f0fdf4}
+.token-card.err{border-color:#fecaca;background:#fef2f2}
 .token-label{font-size:10px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
 .token-status{font-size:12px;font-weight:700;margin-bottom:10px;line-height:1.5}
-.token-status.ok{color:var(--success)}
-.token-status.err{color:var(--danger)}
+.token-status.ok{color:#059669}
+.token-status.err{color:#dc2626}
 .token-status.pending{color:var(--muted)}
-.token-card button{width:100%;padding:8px;font-size:11px;margin-top:6px;background:rgba(139,92,246,0.15);border:1px solid rgba(139,92,246,0.3);color:var(--accent);border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;transition:0.2s}
-.token-card button:hover{background:rgba(139,92,246,0.25)}
+.token-card button{width:100%;padding:8px;font-size:11px;margin-top:6px;background:rgba(79,70,229,0.08);border:1px solid rgba(79,70,229,0.2);color:var(--accent);border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;transition:0.2s}
+.token-card button:hover{background:rgba(79,70,229,0.15)}
 .token-card button:active{transform:scale(0.97)}
 .stats-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:20px}
-.stat-box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px}
+.stat-box{background:#ffffff;border:1px solid var(--border);border-radius:12px;padding:12px}
 .stat-box .stat-lbl{font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:4px}
-.stat-box .stat-val{font-size:17px;font-weight:800;color:var(--text)}
-.stat-box .stat-val.ok{color:var(--success)}
-.stat-box .stat-val.err{color:var(--danger)}
+.stat-box .stat-val{font-size:17px;font-weight:800;color:#0f172a}
+.stat-box .stat-val.ok{color:#059669}
+.stat-box .stat-val.err{color:#dc2626}
 .code-actions{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
-.code-actions button{flex:1;min-width:100px;padding:10px;background:rgba(255,255,255,0.05);border:1px solid var(--border);color:var(--text);border-radius:10px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;transition:0.2s}
-.code-actions button:hover{background:rgba(255,255,255,0.1)}
+.code-actions button{flex:1;min-width:100px;padding:10px;background:#ffffff;border:1px solid var(--border);color:var(--text);border-radius:10px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;transition:0.2s}
+.code-actions button:hover{background:#f8fafc}
 .code-actions button:active{transform:scale(0.97)}
-.code-actions button.primary{background:linear-gradient(135deg,#8b5cf6,#6366f1);border-color:transparent;box-shadow:0 4px 12px var(--accent-glow)}
-.api-log{max-height:400px;overflow-y:auto;font-family:'Courier New',monospace;font-size:11px;background:rgba(0,0,0,0.5);border-radius:12px;padding:12px;line-height:1.7}
-.api-log .log-entry{margin-bottom:6px;word-break:break-word;padding-bottom:4px;border-bottom:1px dashed rgba(255,255,255,0.04)}
+.code-actions button.primary{background:linear-gradient(135deg,#4f46e5,#6366f1);color:#fff;border-color:transparent;box-shadow:0 4px 12px var(--accent-glow)}
+.api-log{max-height:400px;overflow-y:auto;font-family:'Courier New',monospace;font-size:11px;background:#f8fafc;border:1px solid var(--border);border-radius:12px;padding:12px;line-height:1.7}
+.api-log .log-entry{margin-bottom:6px;word-break:break-word;padding-bottom:4px;border-bottom:1px dashed var(--border)}
 .api-log .log-entry:last-child{border-bottom:none}
-.log-info{color:#67e8f9}.log-success{color:#34d399}.log-warning{color:#fbbf24}
-.log-error{color:#f87171}.log-request{color:#a78bfa}.log-response{color:#94a3b8}
-.log-time{color:#64748b;margin-right:6px}
+.log-info{color:#0284c7}.log-success{color:#059669}.log-warning{color:#d97706}
+.log-error{color:#dc2626}.log-request{color:#4f46e5}.log-response{color:#64748b}
+.log-time{color:#94a3b8;margin-right:6px}
 .log-tag{font-weight:800;margin-right:6px}
-.auto-section{border:1px solid rgba(6,182,212,0.3);background:linear-gradient(135deg,rgba(6,182,212,0.08),rgba(139,92,246,0.05));border-radius:20px;padding:16px;margin-bottom:16px}
+.auto-section{border:1px solid rgba(79,70,229,0.2);background:linear-gradient(135deg,rgba(79,70,229,0.03),rgba(14,165,233,0.03));border-radius:20px;padding:16px;margin-bottom:16px}
 .auto-toggle-row{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px}
 .auto-info{flex:1;min-width:0}
-.auto-title{font-size:13px;font-weight:800;color:var(--text);margin-bottom:4px}
+.auto-title{font-size:13px;font-weight:800;color:#0f172a;margin-bottom:4px}
 .auto-status{font-size:11px;color:var(--muted);font-weight:600}
 .auto-btn{flex-shrink:0;padding:10px 20px;font-size:12px;font-weight:800;border-radius:10px;cursor:pointer;font-family:inherit;transition:0.2s;border:none}
 .auto-btn[data-state="on"]{background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff;box-shadow:0 4px 12px rgba(239,68,68,0.3)}
 .auto-btn[data-state="off"]{background:linear-gradient(135deg,#10b981,#059669);color:#fff;box-shadow:0 4px 12px rgba(16,185,129,0.3)}
-.realtime-badge{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:800;color:#22d3ee;background:rgba(34,211,238,0.1);border:1px solid rgba(34,211,238,0.3);border-radius:6px;padding:2px 6px;margin-left:6px;letter-spacing:0.5px}
-.realtime-badge .dot{width:6px;height:6px;border-radius:50%;background:#22d3ee;box-shadow:0 0 6px #22d3ee;animation:pulse-rt 1.2s infinite}
+.realtime-badge{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:800;color:#0ea5e9;background:rgba(14,165,233,0.08);border:1px solid rgba(14,165,233,0.2);border-radius:6px;padding:2px 6px;margin-left:6px;letter-spacing:0.5px}
+.realtime-badge .dot{width:6px;height:6px;border-radius:50%;background:#0ea5e9;box-shadow:0 0 6px #0ea5e9;animation:pulse-rt 1.2s infinite}
 @keyframes pulse-rt{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(1.4)}}
-.manual-panel{background:linear-gradient(135deg,rgba(245,158,11,0.08),rgba(239,68,68,0.05));border:1px solid rgba(245,158,11,0.3);border-radius:20px;padding:16px;margin-bottom:16px}
-.manual-panel input{margin-bottom:10px;padding:14px}
+.manual-panel{background:#fffbeb;border:1px solid #fde68a;border-radius:20px;padding:16px;margin-bottom:16px}
+.manual-panel input{margin-bottom:10px;padding:14px;background:#ffffff}
 .manual-panel button{padding:14px;font-size:15px}
-.force-panel{background:linear-gradient(135deg,rgba(6,182,212,0.1),rgba(139,92,246,0.05));border:1px solid rgba(6,182,212,0.4);border-radius:20px;padding:16px;margin-bottom:16px}
+.force-panel{background:#f0f9ff;border:1px solid #bae6fd;border-radius:20px;padding:16px;margin-bottom:16px}
 .force-panel p{font-size:11px;color:var(--muted);line-height:1.6;margin-bottom:10px}
 .auto-log{max-height:240px;overflow-y:auto;font-size:12px;line-height:1.6}
-.auto-log .event{padding:8px 10px;border-radius:8px;margin-bottom:6px;border-left:3px solid transparent}
-.auto-log .event.success{background:rgba(16,185,129,0.08);border-left-color:#10b981}
-.auto-log .event.fail{background:rgba(239,68,68,0.08);border-left-color:#ef4444}
-.auto-log .event.skipped{background:rgba(148,163,184,0.08);border-left-color:#94a3b8}
-.auto-log .event .ev-code{font-family:'Courier New',monospace;font-weight:800;color:#34d399;font-size:13px}
+.auto-log .event{padding:8px 10px;border-radius:8px;margin-bottom:6px;border-left:3px solid transparent;background:#f8fafc}
+.auto-log .event.success{background:#ecfdf5;border-left-color:#10b981}
+.auto-log .event.fail{background:#fef2f2;border-left-color:#ef4444}
+.auto-log .event.skipped{background:#f1f5f9;border-left-color:#94a3b8}
+.auto-log .event .ev-code{font-family:'Courier New',monospace;font-weight:800;color:#059669;font-size:13px}
 .auto-log .event .ev-meta{color:var(--muted);font-size:10px;margin-top:2px}
 .footer{text-align:center;color:var(--muted);font-size:12px;margin-top:40px;font-weight:500}
 .footer a{color:var(--accent2);text-decoration:none}
-.session-banner{background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);border-radius:12px;padding:10px 14px;font-size:11px;color:#6ee7b7;margin-bottom:16px;display:none}
+.session-banner{background:#ecfdf5;border:1px solid #a7f3d0;border-radius:12px;padding:10px 14px;font-size:11px;color:#047857;margin-bottom:16px;display:none}
 .session-banner.show{display:flex;justify-content:space-between;align-items:center;gap:10px}
-.session-banner button{background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;padding:6px 10px;border-radius:8px;font-size:10px;font-weight:700;cursor:pointer;font-family:inherit}
+.session-banner button{background:#fef2f2;border:1px solid #fecaca;color:#dc2626;padding:6px 10px;border-radius:8px;font-size:10px;font-weight:700;cursor:pointer;font-family:inherit}
 </style>
 </head>
 <body>
@@ -2112,15 +2095,15 @@ body>*{position:relative;z-index:1}
   <div class="header">
     <div class="logo"><svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
     <h1>Auto Tool <span>VIP</span></h1>
-    <p>Real-time 24/7 · Auto-redeem &lt;100ms</p>
+    <p>Real-time 24/7 · Siêu Tốc &lt;100ms</p>
   </div>
   <div class="panel" style="text-align:center">
     <div style="padding:20px 0">
       <div style="font-size:52px;margin-bottom:16px">🎮</div>
-      <div style="font-size:16px;font-weight:700;margin-bottom:8px">Tool Auto LC79 VIP</div>
+      <div style="font-size:16px;font-weight:700;margin-bottom:8px;color:#0f172a">Tool Auto LC79 VIP</div>
       <div style="font-size:13px;color:var(--muted);margin-bottom:24px;line-height:1.6">
         Đăng nhập 1 lần — dùng mãi mãi<br>
-        <strong style="color:var(--accent2)">⚡ Event + Fast-poll 0.1s</strong><br>
+        <strong style="color:var(--accent2)">⚡ Siêu Tốc (Bỏ LC79 tự động)</strong><br>
         <strong style="color:var(--success)">💾 Tự cập nhật code mới không cần F5</strong><br>
         <strong style="color:var(--warning)">🔁 Auto-restore sau server restart</strong>
       </div>
@@ -2155,7 +2138,7 @@ body>*{position:relative;z-index:1}
 <div id="view-otp" class="view">
   <button class="btn btn-ghost" style="margin-bottom:16px;padding:10px" onclick="restart()">← Làm lại</button>
   <div class="lc-header">
-    <div class="lc-icon" style="color:var(--accent2);background:rgba(6,182,212,0.1);border-color:rgba(6,182,212,0.3)"><svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg></div>
+    <div class="lc-icon" style="color:var(--accent2);background:rgba(14,165,233,0.08);border-color:rgba(14,165,233,0.2)"><svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg></div>
     <h2>Nhập Mã OTP</h2>
     <p>Kiểm tra Telegram để lấy mã</p>
   </div>
@@ -2171,8 +2154,8 @@ body>*{position:relative;z-index:1}
 <!-- STEP 3: 2FA -->
 <div id="view-2fa" class="view">
   <button class="btn btn-ghost" style="margin-bottom:16px;padding:10px" onclick="restart()">← Làm lại</button>
-  <div class="lc-header" style="border-color:rgba(239,68,68,0.3)">
-    <div class="lc-icon" style="color:var(--danger);background:rgba(239,68,68,0.1);border-color:rgba(239,68,68,0.3)"><svg class="icon icon-lg" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+  <div class="lc-header" style="border-color:#fecaca">
+    <div class="lc-icon" style="color:var(--danger);background:#fef2f2;border-color:#fecaca"><svg class="icon icon-lg" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
     <h2>Xác Thực 2 Lớp</h2>
     <p>Tài khoản được bảo vệ bằng 2FA</p>
   </div>
@@ -2188,8 +2171,8 @@ body>*{position:relative;z-index:1}
 <!-- STEP 4: GAME LOGIN -->
 <div id="view-game" class="view">
   <button class="btn btn-ghost" style="margin-bottom:16px;padding:10px" onclick="restart()">← Làm lại</button>
-  <div class="lc-header" style="border-color:rgba(6,182,212,0.3)">
-    <div class="lc-icon" style="color:var(--accent2);background:rgba(6,182,212,0.1);border-color:rgba(6,182,212,0.3)"><svg class="icon icon-lg" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 12h4m-2-2v4"/></svg></div>
+  <div class="lc-header" style="border-color:#bae6fd">
+    <div class="lc-icon" style="color:var(--accent2);background:#f0f9ff;border-color:#bae6fd"><svg class="icon icon-lg" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 12h4m-2-2v4"/></svg></div>
     <h2>Đăng Nhập Game LC79</h2>
     <p>Nhập 1 lần — lưu vĩnh viễn</p>
   </div>
@@ -2211,16 +2194,16 @@ body>*{position:relative;z-index:1}
     <button onclick="forgetDevice()">Đăng xuất</button>
   </div>
 
-  <div class="lc-header" style="border-color:rgba(16,185,129,0.3)">
-    <div class="lc-icon" style="color:var(--success);background:rgba(16,185,129,0.1);border-color:rgba(16,185,129,0.3)"><svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></div>
+  <div class="lc-header" style="border-color:#a7f3d0">
+    <div class="lc-icon" style="color:var(--success);background:#ecfdf5;border-color:#a7f3d0"><svg class="icon icon-lg" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></div>
     <h2>Dashboard VIP</h2>
-    <p>Real-time · Auto-restore · No reset</p>
+    <p>Real-time · Auto-restore · Siêu Tốc</p>
   </div>
 
   <div class="info-card">
     <div class="info-row"><span class="info-label">Tài khoản</span><span class="info-value" id="info-username">-</span></div>
-    <div class="info-row"><span class="info-label">Số dư Vin</span><span class="info-value" id="info-balance" style="color:var(--success)">0</span></div>
-    <div class="info-row"><span class="info-label">Xu</span><span class="info-value" id="info-xu" style="color:var(--accent2)">0</span></div>
+    <div class="info-row"><span class="info-label">Số dư Vin</span><span class="info-value" id="info-balance" style="color:#059669">0</span></div>
+    <div class="info-row"><span class="info-label">Xu</span><span class="info-value" id="info-xu" style="color:#0ea5e9">0</span></div>
     <div class="info-row"><span class="info-label">Đăng nhập lúc</span><span class="info-value" id="info-login-time" style="font-size:12px;color:var(--muted)">-</span></div>
   </div>
 
@@ -2244,16 +2227,15 @@ body>*{position:relative;z-index:1}
     <div class="auto-toggle-row">
       <div class="auto-info">
         <div class="auto-title">Auto Watch + Redeem
-          <span class="realtime-badge"><span class="dot"></span>REAL-TIME</span>
+          <span class="realtime-badge"><span class="dot"></span>SIÊU TỐC</span>
         </div>
         <div class="auto-status" id="auto-status">⚪ Chưa bật</div>
       </div>
       <button class="auto-btn" id="btn-auto-toggle" data-state="off" onclick="toggleAuto()">BẬT</button>
     </div>
     <div style="font-size:11px;color:var(--muted);line-height:1.6">
-      📡 Event handler (push, &lt;100ms) + Fast-poll 0.1s (safety net) — double layer, không bỏ lỡ code nào.<br>
-      💾 Auto-watch <strong style="color:var(--success)">treo 24/7</strong> — tắt tab / reload / restart server vẫn tiếp tục chạy.<br>
-      🚀 Bỏ prefix <strong style="color:var(--accent2)">LC79</strong> tự động trước khi gửi API.
+      📡 Event handler (push, &lt;100ms) + Fast-poll 0.1s — Bắn mã đã bỏ LC79 (VD: CAITFOPNM).<br>
+      💾 Auto-watch <strong style="color:var(--success)">treo 24/7</strong> — tắt tab / reload / restart server vẫn tiếp tục chạy.
     </div>
   </div>
 
@@ -2612,7 +2594,7 @@ async function refreshAutoEvents() {
       const isSkipped = e.status === 'skipped';
       const cls = isSuccess ? 'success' : isSkipped ? 'skipped' : 'fail';
       const icon = isSuccess ? '✅' : isSkipped ? '⏸' : '❌';
-      const amtStr = e.amount ? ` <strong style="color:var(--success)">+${Number(e.amount).toLocaleString('vi-VN')}</strong>` : '';
+      const amtStr = e.amount ? ` <strong style="color:#059669">+${Number(e.amount).toLocaleString('vi-VN')}</strong>` : '';
       const rawStr = e.raw_code && e.raw_code !== e.code
         ? ` <span style="color:var(--muted);font-size:10px">(raw: ${e.raw_code})</span>` : '';
       const timing = [];
@@ -2658,10 +2640,10 @@ async function fetchCodes(silent = false) {
       container.innerHTML = '<div style="text-align:center;color:var(--muted);padding:20px">Không tìm thấy code.</div>';
       state.codes = [];
     } else {
-      container.innerHTML = `<div style="color:var(--danger);text-align:center;padding:20px">${data.message || 'Lỗi'}</div>`;
+      container.innerHTML = `<div style="color:#dc2626;text-align:center;padding:20px">${data.message || 'Lỗi'}</div>`;
       state.codes = [];
     }
-  } catch (e) { if(!silent) container.innerHTML = '<div style="color:var(--danger);text-align:center;padding:20px">Lỗi kết nối!</div>'; }
+  } catch (e) { if(!silent) container.innerHTML = '<div style="color:#dc2626;text-align:center;padding:20px">Lỗi kết nối!</div>'; }
   if (!silent) await refreshStats();
 }
 
@@ -2813,7 +2795,7 @@ setInterval(() => {
 
 
 # ================================================================
-#                    ALIVE PAGE
+#                    ALIVE PAGE (LIGHT THEME)
 # ================================================================
 ALIVE_HTML = r"""<!DOCTYPE html>
 <html lang="vi">
@@ -2823,18 +2805,18 @@ ALIVE_HTML = r"""<!DOCTYPE html>
 <title>Server Alive</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#05050a;color:#f8fafc;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background-image:radial-gradient(circle at 0% 0%,rgba(139,92,246,0.15) 0%,transparent 50%),radial-gradient(circle at 100% 100%,rgba(16,185,129,0.15) 0%,transparent 50%);background-attachment:fixed}
-.card{background:rgba(20,24,39,0.6);backdrop-filter:blur(12px);border:1px solid rgba(16,185,129,0.3);border-radius:24px;padding:48px 40px;text-align:center;max-width:440px;width:100%;box-shadow:0 20px 60px rgba(16,185,129,0.15)}
-.icon-wrap{width:88px;height:88px;margin:0 auto 24px;border-radius:24px;background:linear-gradient(135deg,rgba(16,185,129,0.2),rgba(6,182,212,0.2));border:1px solid rgba(16,185,129,0.4);display:flex;align-items:center;justify-content:center;font-size:44px;animation:breathe 2.5s ease-in-out infinite}
-@keyframes breathe{0%,100%{transform:scale(1);box-shadow:0 0 30px rgba(16,185,129,0.3)}50%{transform:scale(1.05);box-shadow:0 0 50px rgba(16,185,129,0.5)}}
-h1{font-size:28px;font-weight:800;margin-bottom:8px;background:linear-gradient(to right,#34d399,#22d3ee);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.status{display:inline-flex;align-items:center;gap:8px;color:#34d399;font-size:13px;font-weight:600;margin-bottom:24px}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f1f5f9;color:#1e293b;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{background:#ffffff;border:1px solid #e2e8f0;border-radius:24px;padding:48px 40px;text-align:center;max-width:440px;width:100%;box-shadow:0 10px 25px rgba(0,0,0,0.05)}
+.icon-wrap{width:88px;height:88px;margin:0 auto 24px;border-radius:24px;background:linear-gradient(135deg,rgba(16,185,129,0.1),rgba(14,165,233,0.1));border:1px solid rgba(16,185,129,0.2);display:flex;align-items:center;justify-content:center;font-size:44px;animation:breathe 2.5s ease-in-out infinite}
+@keyframes breathe{0%,100%{transform:scale(1);box-shadow:0 0 20px rgba(16,185,129,0.1)}50%{transform:scale(1.05);box-shadow:0 0 30px rgba(16,185,129,0.2)}}
+h1{font-size:28px;font-weight:800;margin-bottom:8px;background:linear-gradient(to right,#059669,#0ea5e9);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.status{display:inline-flex;align-items:center;gap:8px;color:#059669;font-size:13px;font-weight:600;margin-bottom:24px}
 .dot{width:10px;height:10px;border-radius:50%;background:#10b981;box-shadow:0 0 12px #10b981;animation:pulse 1.5s ease-in-out infinite}
 @keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.4);opacity:.6}}
-.stat{background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:14px 18px;margin-top:12px;display:flex;justify-content:space-between;align-items:center}
-.stat-label{color:#94a3b8;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.8px}
-.stat-value{color:#34d399;font-size:15px;font-weight:800;font-family:'Courier New',monospace}
-.link-back{display:inline-block;margin-top:24px;color:#22d3ee;text-decoration:none;font-size:13px;font-weight:600}
+.stat{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:14px 18px;margin-top:12px;display:flex;justify-content:space-between;align-items:center}
+.stat-label{color:#64748b;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.8px}
+.stat-value{color:#059669;font-size:15px;font-weight:800;font-family:'Courier New',monospace}
+.link-back{display:inline-block;margin-top:24px;color:#0ea5e9;text-decoration:none;font-size:13px;font-weight:600}
 </style>
 </head>
 <body>
