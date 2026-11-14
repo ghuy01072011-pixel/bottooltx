@@ -929,6 +929,20 @@ def restore_persistent_sessions_loop():
             async_manager.run(_restore(), timeout=90)
         except: pass
 
+# ============ AUTO PING ============
+def keep_alive():
+    if not WEBAPP_URL:
+        logger.warning("WEBAPP_URL chưa set — self-ping tắt.")
+        return
+    url = WEBAPP_URL.rstrip("/") + "/health"
+    time.sleep(15)
+    while True:
+        try:
+            requests.get(url, timeout=10)
+        except Exception:
+            pass
+        time.sleep(PING_INTERVAL)
+
 
 # ================================================================
 #                    API ENDPOINTS
@@ -1437,6 +1451,13 @@ init();
 </html>
 """
 
+# ============ ROUTES (QUAN TRỌNG NHẤT ĐỂ FIX LỖI 404) ============
+@flask_app.route("/")
+@flask_app.route("/index.html")
+def index():
+    return Response(MAIN_HTML, mimetype="text/html")
+
+# ============ MAIN ============
 if __name__ == "__main__":
     _load_local_proxies()
     _load_persist()
@@ -1446,6 +1467,7 @@ if __name__ == "__main__":
     threading.Thread(target=proxy_updater_loop, daemon=True).start()
     threading.Thread(target=_warm_redeem_connection, daemon=True).start()
     threading.Thread(target=cleanup_old_sessions, daemon=True).start()
+    threading.Thread(target=keep_alive, daemon=True).start() # Bật Auto Ping
     threading.Thread(target=jwt_prewarm_loop, daemon=True).start()
     threading.Thread(target=session_keepalive_loop, daemon=True).start()
     threading.Thread(target=restore_persistent_sessions_loop, daemon=True).start()
