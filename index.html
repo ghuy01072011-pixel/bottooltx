@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Auto Tool VIP</title>
+<style>
+    :root { --bg: #f1f5f9; --card: #ffffff; --text: #1e293b; --muted: #64748b; --primary: #3b82f6; --success: #10b981; --danger: #ef4444; --border: #e2e8f0; }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+    body { background: var(--bg); color: var(--text); padding: 16px; display: flex; justify-content: center; }
+    .container { width: 100%; max-width: 480px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 20px; margin-bottom: 16px; box-shadow: 0 2px 4px rgba(0,0,0,0.02); }
+    h1, h2, h3 { margin-bottom: 12px; color: var(--text); }
+    h1 { font-size: 22px; text-align: center; }
+    h2 { font-size: 14px; font-weight: 700; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--border); padding-bottom: 8px; margin-top: 24px; display: flex; justify-content: space-between; }
+    label { display: block; font-size: 12px; font-weight: 700; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; }
+    input { width: 100%; padding: 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px; margin-bottom: 16px; outline: none; background: #f8fafc; transition: border 0.2s; }
+    input:focus { border-color: var(--primary); background: #fff; }
+    button { width: 100%; padding: 14px; border: none; border-radius: 8px; font-size: 14px; font-weight: 700; color: #fff; cursor: pointer; background: var(--primary); transition: transform 0.1s, opacity 0.2s; }
+    button:active { transform: scale(0.98); }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .btn-success { background: var(--success); }
+    .btn-danger { background: var(--danger); }
+    .btn-outline { background: transparent; color: var(--primary); border: 1px solid var(--primary); }
+    .btn-warning { background: #f59e0b; }
+    .view { display: none; }
+    .view.active { display: block; animation: fadeIn 0.3s; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    .alert { padding: 12px; border-radius: 8px; font-size: 13px; font-weight: 500; margin-bottom: 16px; display: none; }
+    .alert.show { display: block; }
+    .alert-err { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+    .row { display: flex; gap: 12px; margin-bottom: 12px; }
+    .row > div { flex: 1; }
+    .token-card { border: 1px solid var(--border); border-radius: 8px; padding: 12px; text-align: center; }
+    .token-card.ok { border-color: #a7f3d0; background: #ecfdf5; }
+    .token-card.ok .status { color: var(--success); }
+    .token-card.err { border-color: #fecaca; background: #fef2f2; }
+    .token-card.err .status { color: var(--danger); }
+    .status { font-size: 12px; font-weight: 700; margin-top: 8px; color: var(--muted); }
+    .log-box { background: #f8fafc; border: 1px solid var(--border); border-radius: 8px; padding: 12px; height: 200px; overflow-y: auto; font-size: 12px; font-family: monospace; }
+    .log-item { padding: 8px; border-bottom: 1px solid var(--border); }
+    .log-item:last-child { border-bottom: none; }
+    .log-item.success { color: var(--success); }
+    .log-item.fail { color: var(--danger); }
+    .code-list { display: flex; flex-direction: column; gap: 8px; }
+    .code-item { display: flex; justify-content: space-between; align-items: center; background: #f8fafc; border: 1px solid var(--border); padding: 10px 12px; border-radius: 8px; font-weight: 700; font-family: monospace; color: var(--primary); }
+    .copy-btn { width: auto; padding: 6px 12px; font-size: 11px; }
+    .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: #10b981; color: #fff; padding: 10px 20px; border-radius: 8px; font-weight: 700; font-size: 13px; z-index: 9999; transition: 0.3s; opacity: 1; }
+</style>
+</head>
+<body>
+<div class="container">
+    <!-- VIEW: LOGIN -->
+    <div id="view-login" class="view active">
+        <div class="card">
+            <h1>🚀 Auto Tool VIP</h1>
+            <div id="alert-login" class="alert alert-err"></div>
+            <div id="step-api">
+                <label>API ID</label>
+                <input type="number" id="apiId" placeholder="VD: 12345678">
+                <label>API HASH</label>
+                <input type="password" id="apiHash" placeholder="Nhập API HASH">
+                <label>SĐT Telegram</label>
+                <input type="tel" id="phone" placeholder="+84987654321">
+                <button onclick="sendOTP()" id="btn-send">Gửi OTP</button>
+            </div>
+            <div id="step-otp" style="display:none;">
+                <label>Mã OTP</label>
+                <input type="text" id="otpCode" placeholder="Nhập mã OTP" inputmode="numeric">
+                <button onclick="verifyOTP()" id="btn-verify">Xác Nhận OTP</button>
+            </div>
+            <div id="step-2fa" style="display:none;">
+                <label>Mật khẩu 2FA</label>
+                <input type="password" id="pass2fa" placeholder="Nhập mật khẩu 2FA">
+                <button onclick="verify2FA()" id="btn-2fa">Xác Nhận 2FA</button>
+            </div>
+            <div id="step-game" style="display:none;">
+                <label>Tài khoản Game</label>
+                <input type="text" id="gameUser" placeholder="Username">
+                <input type="password" id="gamePass" placeholder="Mật khẩu">
+                <button class="btn-success" onclick="loginGame()" id="btn-game">Đăng Nhập Game</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- VIEW: DASHBOARD -->
+    <div id="view-dash" class="view">
+        <div class="card" style="text-align:center; padding:16px;">
+            <h2 style="border:none; margin:0; justify-content:center; color:var(--success);">🟢 TOOL ĐANG CHẠY</h2>
+            <p id="info-user" style="font-size:13px; margin-top:8px; font-weight:600;"></p>
+        </div>
+
+        <div class="row">
+            <div class="token-card" id="tc-at">
+                <div>Access Token</div>
+                <div class="status">Chưa có</div>
+            </div>
+            <div class="token-card" id="tc-jwt">
+                <div>JWT Token</div>
+                <div class="status">Chưa có</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>⚡ Auto Watch & Redeem</h2>
+            <p style="font-size:12px; color:var(--muted); margin-bottom:12px;">Nhận code tự động qua Telegram. Bắn API siêu tốc, tự động bỏ tiền tố LC79.</p>
+            <button id="btn-auto" class="btn-success" onclick="toggleAuto()">BẬT AUTO</button>
+        </div>
+
+        <div class="card">
+            <h2>🔔 Quét Lại Code</h2>
+            <p style="font-size:12px; color:var(--muted); margin-bottom:12px;">Quét 20 tin nhắn gần nhất trên kênh Telegram và tự động nhập các mã chưa dùng.</p>
+            <button class="btn-warning" onclick="forceScan()" id="btn-scan">🔔 QUÉT NGAY</button>
+        </div>
+
+        <div class="card">
+            <h2>🎯 Nhập Code Thủ Công</h2>
+            <input type="text" id="manualCode" placeholder="VD: ABCXYZ" style="text-transform:uppercase;">
+            <button onclick="redeemManual()" id="btn-manual">⚡ NHẬP NGAY</button>
+        </div>
+
+        <h2>Auto Redeem Log</h2>
+        <div class="log-box" id="auto-log">
+            <div style="text-align:center; color:var(--muted);">Chưa có hoạt động</div>
+        </div>
+
+        <h2>Giftcode Mới Nhất</h2>
+        <div class="code-list" id="code-list">
+            <div style="text-align:center; color:var(--muted); font-size:13px; padding:10px;">Đang tải...</div>
+        </div>
+        
+        <div style="text-align:center; margin-top:24px; margin-bottom: 24px;">
+            <button class="btn-outline" onclick="logout()" style="width:auto; padding:8px 24px; font-size:12px;">Đăng xuất</button>
+        </div>
+    </div>
+</div>
+
+<script>
+const state = { sid: '', token: '', auto: false };
+let lastLogJson = '';
+let lastCodeJson = '';
+let pollTimer = null;
+
+// UI Helpers
+const $ = id => document.getElementById(id);
+const showView = id => { document.querySelectorAll('.view').forEach(v => v.classList.remove('active')); $(id).classList.add('active'); };
+const showAlert = (msg, type='err') => { const a = $('alert-login'); a.className = `alert alert-${type} show`; a.innerText = msg; };
+const toast = (msg) => { 
+    const t = document.createElement('div'); 
+    t.className = 'toast'; 
+    t.innerText = msg; 
+    document.body.appendChild(t); 
+    setTimeout(()=>{ t.style.opacity = 0; setTimeout(()=>t.remove(), 300); }, 2500); 
+};
+
+// LOGIN FLOW
+async function sendOTP() {
+    const api_id = $('apiId').value, api_hash = $('apiHash').value, phone = $('phone').value;
+    if(!api_id || !api_hash || !phone) return showAlert('Nhập đủ thông tin!');
+    $('btn-send').disabled = true; $('btn-send').innerText = 'Đang gửi...';
+    try {
+        const res = await fetch('/api/send_code', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({api_id, api_hash, phone})});
+        const data = await res.json();
+        if(data.status === 'ok') { 
+            state.sid = data.session_id; 
+            $('step-api').style.display='none'; 
+            $('step-otp').style.display='block'; 
+        }
+        else showAlert(data.message);
+    } catch(e) { showAlert('Lỗi kết nối'); }
+    $('btn-send').disabled = false; $('btn-send').innerText = 'Gửi OTP';
+}
+
+async function verifyOTP() {
+    const code = $('otpCode').value;
+    if(!code) return showAlert('Nhập OTP!');
+    $('btn-verify').disabled = true; $('btn-verify').innerText = 'Đang xác thực...';
+    try {
+        const res = await fetch('/api/verify_code', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({session_id: state.sid, code})});
+        const data = await res.json();
+        if(data.status === 'ok') { 
+            state.token = data.persist_token; 
+            $('step-otp').style.display='none'; 
+            $('step-game').style.display='block'; 
+        }
+        else if(data.status === '2fa') { 
+            $('step-otp').style.display='none'; 
+            $('step-2fa').style.display='block'; 
+        }
+        else showAlert(data.message);
+    } catch(e) { showAlert('Lỗi kết nối'); }
+    $('btn-verify').disabled = false; $('btn-verify').innerText = 'Xác Nhận OTP';
+}
+
+async function verify2FA() {
+    const password = $('pass2fa').value;
+    if(!password) return showAlert('Nhập 2FA!');
+    $('btn-2fa').disabled = true; $('btn-2fa').innerText = 'Đang xác thực...';
+    try {
+        const res = await fetch('/api/verify_2fa', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({session_id: state.sid, password})});
+        const data = await res.json();
+        if(data.status === 'ok') { 
+            state.token = data.persist_token; 
+            $('step-2fa').style.display='none'; 
+            $('step-game').style.display='block'; 
+        }
+        else showAlert(data.message);
+    } catch(e) { showAlert('Lỗi kết nối'); }
+    $('btn-2fa').disabled = false; $('btn-2fa').innerText = 'Xác Nhận 2FA';
+}
+
+async function loginGame() {
+    const username = $('gameUser').value, password = $('gamePass').value;
+    if(!username || !password) return showAlert('Nhập đủ tài khoản game!');
+    $('btn-game').disabled = true; $('btn-game').innerText = 'Đang đăng nhập...';
+    try {
+        const res = await fetch('/api/login_game', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({username, password, session_id: state.sid, persist_token: state.token})});
+        const data = await res.json();
+        if(data.status === 'ok') {
+            localStorage.setItem('lc79_token', state.token);
+            $('info-user').innerText = `Tài khoản: ${data.username} | Vin: ${data.balance} | Xu: ${data.xuTotal}`;
+            showView('view-dash');
+            startPolling(); 
+        } else showAlert(data.message);
+    } catch(e) { showAlert('Lỗi kết nối'); }
+    $('btn-game').disabled = false; $('btn-game').innerText = 'Đăng Nhập Game';
+}
+
+// DASHBOARD FLOW
+async function toggleAuto() {
+    const enable = !state.auto;
+    $('btn-auto').disabled = true;
+    try {
+        const res = await fetch('/api/toggle_auto', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({session_id: state.sid, enabled: enable})});
+        const data = await res.json();
+        if(data.status === 'ok') { 
+            setAutoState(enable); 
+            toast(enable ? '🎯 Đã Bật Auto' : '🛑 Đã Tắt Auto'); 
+        }
+    } catch(e) {}
+    $('btn-auto').disabled = false;
+}
+
+function setAutoState(isOn) {
+    state.auto = isOn;
+    const b = $('btn-auto');
+    b.innerText = isOn ? 'TẮT AUTO' : 'BẬT AUTO';
+    b.className = isOn ? 'btn-danger' : 'btn-success';
+}
+
+async function forceScan() {
+    $('btn-scan').disabled = true; $('btn-scan').innerText = 'Đang quét...';
+    try {
+        const res = await fetch('/api/force_scan', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({session_id: state.sid})});
+        const data = await res.json();
+        if(data.status === 'ok') toast(`Đã quét và bắn ${data.fired} code`);
+        else toast('Lỗi: ' + data.message);
+    } catch(e) { toast('Lỗi kết nối'); }
+    $('btn-scan').disabled = false; $('btn-scan').innerText = '🔔 QUÉT NGAY';
+}
+
+async function redeemManual() {
+    const code = $('manualCode').value;
+    if(!code) return toast('Nhập code trước');
+    $('btn-manual').disabled = true; $('btn-manual').innerText = 'Đang bắn...';
+    try {
+        const res = await fetch('/api/redeem_manual', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({session_id: state.sid, code})});
+        const data = await res.json();
+        if(data.http === 200 || data.http === 201) {
+            toast(`✅ Nhập thành công: +${data.amount || '?'}`);
+            $('manualCode').value = '';
+        } else {
+            toast(`❌ Lỗi: ${data.message || 'Code không hợp lệ'}`);
+        }
+    } catch(e) { toast('Lỗi kết nối'); }
+    $('btn-manual').disabled = false; $('btn-manual').innerText = '⚡ NHẬP NGAY';
+}
+
+// POLLING (Tối ưu siêu nhẹ, chỉ update DOM khi có data mới)
+async function poll() {
+    if(!state.sid) return;
+    try {
+        // 1. Check Auto Status & Log
+        const r1 = await fetch('/api/auto_status', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({session_id: state.sid})});
+        const d1 = await r1.json();
+        if(d1.status === 'ok') {
+            if(d1.enabled !== state.auto) setAutoState(d1.enabled);
+            
+            // JWT Status
+            const tcJwt = $('tc-jwt');
+            if(d1.jwt_remaining_minutes > 0) {
+                tcJwt.className = 'token-card ok';
+                tcJwt.querySelector('.status').innerText = `Còn ${d1.jwt_remaining_minutes} phút`;
+            } else {
+                tcJwt.className = 'token-card err';
+                tcJwt.querySelector('.status').innerText = 'Hết hạn';
+            }
+
+            // Render Logs (chỉ render khi có log mới)
+            const logStr = JSON.stringify(d1.events);
+            if(logStr !== lastLogJson) {
+                lastLogJson = logStr;
+                const box = $('auto-log');
+                if(!d1.events || d1.events.length === 0) {
+                    box.innerHTML = '<div style="text-align:center; color:var(--muted);">Chưa có hoạt động</div>';
+                } else {
+                    box.innerHTML = d1.events.slice().reverse().map(e => {
+                        const cls = e.status === 'success' ? 'success' : 'fail';
+                        const proxy = e.is_proxy ? ' [PROXY]' : '';
+                        const amt = e.amount ? ` +${e.amount}` : '';
+                        return `<div class="log-item ${cls}">
+                            [${new Date(e.ts*1000).toLocaleTimeString()}] ${e.code}${proxy}${amt}
+                            <br><small style="color:var(--muted)">HTTP ${e.http} - ${e.elapsed_ms}ms ${e.message ? '- ' + e.message : ''}</small>
+                        </div>`;
+                    }).join('');
+                }
+            }
+        }
+
+        // 2. Get Codes (chỉ khi đang bật auto hoặc vừa mới bật)
+        if(state.auto) {
+            const r2 = await fetch('/api/get_codes', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({session_id: state.sid})});
+            const d2 = await r2.json();
+            if(d2.status === 'ok') {
+                const codeStr = JSON.stringify(d2.items.map(i => i.code));
+                if(codeStr !== lastCodeJson) {
+                    lastCodeJson = codeStr;
+                    const list = $('code-list');
+                    if(d2.items.length === 0) {
+                        list.innerHTML = '<div style="text-align:center; color:var(--muted); font-size:13px; padding:10px;">Không có code nào</div>';
+                    } else {
+                        list.innerHTML = d2.items.map(i => `
+                            <div class="code-item">
+                                <span>${i.code}</span>
+                                <button class="copy-btn" onclick="navigator.clipboard.writeText('${i.code}');toast('Đã Copy')">COPY</button>
+                            </div>
+                        `).join('');
+                    }
+                }
+            }
+        }
+    } catch(e) {}
+    
+    // Lặp lại sau 2s
+    pollTimer = setTimeout(poll, 2000);
+}
+
+function startPolling() {
+    if(pollTimer) clearTimeout(pollTimer);
+    poll();
+}
+
+// AUTO RESUME
+async function init() {
+    const token = localStorage.getItem('lc79_token');
+    if(!token) return;
+    try {
+        const res = await fetch('/api/resume', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({persist_token: token})});
+        const data = await res.json();
+        if(data.status === 'ok') {
+            state.sid = data.session_id; state.token = token;
+            $('info-user').innerText = `Tài khoản: ${data.game_username}`;
+            if(data.auto_enabled) setAutoState(true);
+            showView('view-dash');
+            startPolling();
+        } else {
+            localStorage.removeItem('lc79_token');
+        }
+    } catch(e) {}
+}
+
+function logout() {
+    if(confirm('Bạn có chắc muốn đăng xuất?')) {
+        localStorage.removeItem('lc79_token');
+        location.reload();
+    }
+}
+
+init();
+</script>
+</body>
+</html>
